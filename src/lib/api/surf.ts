@@ -380,8 +380,8 @@ async function fetchWorldTides(lat: number, lng: number): Promise<TidesResult | 
   try {
     const dateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
     const res = await fetch(
-      `https://www.worldtides.info/api/v3?heights&extremes` +
-      `&lat=${lat}&lon=${lng}&key=${key}&date=${dateStr}&days=7&step=3600`,
+      `https://www.worldtides.info/api/v3?extremes` +
+      `&lat=${lat}&lon=${lng}&key=${key}&date=${dateStr}&days=7`,
       { next: { revalidate: 43200 } } // 12h cache — free tier is 1 req/day
     );
     if (res.status === 401) { console.error('[WorldTides] 401 invalid key — check WORLDTIDES_API_KEY in Vercel env vars'); return null; }
@@ -401,20 +401,30 @@ async function fetchWorldTides(lat: number, lng: number): Promise<TidesResult | 
       return { dateStr: `${g('year')}-${g('month')}-${g('day')}`, hour: +(hh + mm / 60).toFixed(4), hh, mm };
     };
 
-    const heights = new Map<string, TidePoint[]>();
     const extremes = new Map<string, TideExtreme[]>();
+    const allExtremes: { dt: number; height: number; type: 'High' | 'Low' }[] = [];
 
-    for (const h of data.heights ?? []) {
-      const { dateStr, hour } = toParts(h.dt);
-      if (!heights.has(dateStr)) heights.set(dateStr, []);
-      heights.get(dateStr)!.push({ hour, height: +h.height.toFixed(3) });
-    }
     for (const e of data.extremes ?? []) {
       const { dateStr, hour, hh, mm } = toParts(e.dt);
       const type: 'High' | 'Low' = e.type === 'High' ? 'High' : 'Low';
       const timeStr = `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
       if (!extremes.has(dateStr)) extremes.set(dateStr, []);
       extremes.get(dateStr)!.push({ hour, height: +e.height.toFixed(3), type, timeStr });
+      allExtremes.push({ dt: e.dt, height: e.height, type });
+    }
+
+    // Build smooth height curve via cosine interpolation between extremes
+    const heights = new Map<string, TidePoint[]>();
+    for (let i = 0; i < allExtremes.length - 1; i++) {
+      const a = allExtremes[i], b = allExtremes[i + 1];
+      const dtA = a.dt, dtB = b.dt, span = dtB - dtA;
+      for (let s = 0; s <= span; s += 3600) {
+        const frac = s / span;
+        const h = +(a.height + (b.height - a.height) * (1 - Math.cos(frac * Math.PI)) / 2).toFixed(3);
+        const { dateStr, hour } = toParts(dtA + s);
+        if (!heights.has(dateStr)) heights.set(dateStr, []);
+        heights.get(dateStr)!.push({ hour, height: h });
+      }
     }
     return { heights, extremes };
   } catch (e) {
