@@ -376,7 +376,7 @@ function computeIsraelTides(): TidesResult {
 
 async function fetchWorldTides(lat: number, lng: number): Promise<TidesResult | null> {
   const key = process.env.WORLDTIDES_API_KEY;
-  if (!key) return null;
+  if (!key) { console.warn('[WorldTides] no API key — using harmonic fallback'); return null; }
   try {
     const dateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
     const res = await fetch(
@@ -384,9 +384,11 @@ async function fetchWorldTides(lat: number, lng: number): Promise<TidesResult | 
       `&lat=${lat}&lon=${lng}&key=${key}&date=${dateStr}&days=8&step=900`,
       { next: { revalidate: 43200 } } // 12h cache — free tier is 1 req/day
     );
-    if (!res.ok) return null;
+    if (res.status === 401) { console.error('[WorldTides] 401 invalid key — check WORLDTIDES_API_KEY in Vercel env vars'); return null; }
+    if (res.status === 429) { console.warn('[WorldTides] 429 quota exceeded — falling back to harmonic model'); return null; }
+    if (!res.ok) { console.error(`[WorldTides] HTTP ${res.status} — falling back to harmonic model`); return null; }
     const data = await res.json();
-    if (data.status !== 200) { console.warn('[WorldTides]', data.error); return null; }
+    if (data.status !== 200) { console.warn('[WorldTides] API error:', data.error, '— falling back'); return null; }
 
     const TZ = 'Asia/Jerusalem';
     const toParts = (dt: number) => {
@@ -414,10 +416,11 @@ async function fetchWorldTides(lat: number, lng: number): Promise<TidesResult | 
       if (!extremes.has(dateStr)) extremes.set(dateStr, []);
       extremes.get(dateStr)!.push({ hour, height: +e.height.toFixed(3), type, timeStr });
     }
-    console.log('[WorldTides] loaded successfully');
+    const extremeCount = [...extremes.values()].reduce((s, a) => s + a.length, 0);
+    console.log(`[WorldTides] ✓ loaded — ${extremeCount} extremes over 8 days`);
     return { heights, extremes };
   } catch (e) {
-    console.error('[WorldTides] fetch failed, falling back to harmonic model:', e);
+    console.error('[WorldTides] unexpected error — falling back to harmonic model:', e);
     return null;
   }
 }
