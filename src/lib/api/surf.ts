@@ -430,7 +430,15 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG): P
     // Prefer StormGlass (multi-model blend); fall back to Open-Meteo Marine current
 
     const now = new Date();
-    const nowIso = now.toISOString().slice(0, 13); // e.g. "2026-03-11T14"
+    // Build nowIso in Israel local time to match Open-Meteo's timezone=Asia/Jerusalem timestamps.
+    // toISOString() is UTC — using it against local-time strings caused nowHourIdx to always be -1.
+    const _ilParts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Jerusalem', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', hour12: false,
+    }).formatToParts(now);
+    const _ilGet = (type: string) => _ilParts.find(p => p.type === type)?.value ?? '0';
+    const _ilDate = `${_ilGet('year')}-${_ilGet('month')}-${_ilGet('day')}`;
+    const nowIso = `${_ilDate}T${(parseInt(_ilGet('hour')) % 24).toString().padStart(2, '0')}`;
 
     let current: SurfCurrent;
 
@@ -538,8 +546,7 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG): P
       waveHeightBiasOffset = Math.max(-0.8, Math.min(0.8, waveHeightBiasOffset));
     }
 
-    const _now = new Date();
-    const todayStr = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, '0')}-${String(_now.getDate()).padStart(2, '0')}`;
+    const todayStr = _ilDate; // Israel local date — matches Open-Meteo and computeIsraelTides keys
     const todayHours: SurfHour[] = [];
 
     for (let i = 0; i < times.length; i++) {
@@ -615,9 +622,7 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG): P
       }
     }
 
-    const _t = new Date(), _tm = new Date(Date.now() + 86400000);
-    const today    = `${_t.getFullYear()}-${String(_t.getMonth()+1).padStart(2,'0')}-${String(_t.getDate()).padStart(2,'0')}`;
-    const tomorrow = `${_tm.getFullYear()}-${String(_tm.getMonth()+1).padStart(2,'0')}-${String(_tm.getDate()).padStart(2,'0')}`;
+    const today = _ilDate; // reuse Israel local date already computed above
     const avg = (arr: number[]) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
 
     const days: SurfDay[] = Object.entries(dayMap).slice(0, 7).map(([date, d]) => {
