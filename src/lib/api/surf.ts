@@ -369,19 +369,72 @@ function computeIsraelTides(): TidesResult {
   return { heights, extremes };
 }
 
+// ── WorldTides API ────────────────────────────────────────────────────────────
+// Authoritative tide predictions for the Israeli Mediterranean coast.
+// Free tier: 1 request/day per location → cache 12h is safe.
+// Falls back to the local harmonic model if the key is missing or the API fails.
+
+async function fetchWorldTides(lat: number, lng: number): Promise<TidesResult | null> {
+  const key = process.env.WORLDTIDES_API_KEY;
+  if (!key) return null;
+  try {
+    const dateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
+    const res = await fetch(
+      `https://www.worldtides.info/api/v3?heights&extremes` +
+      `&lat=${lat}&lon=${lng}&key=${key}&date=${dateStr}&days=8&step=900`,
+      { next: { revalidate: 43200 } } // 12h cache — free tier is 1 req/day
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.status !== 200) { console.warn('[WorldTides]', data.error); return null; }
+
+    const TZ = 'Asia/Jerusalem';
+    const toParts = (dt: number) => {
+      const p = new Intl.DateTimeFormat('en-CA', {
+        timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: false,
+      }).formatToParts(new Date(dt * 1000));
+      const g = (t: string) => p.find(x => x.type === t)?.value ?? '0';
+      const hh = parseInt(g('hour')) % 24, mm = parseInt(g('minute'));
+      return { dateStr: `${g('year')}-${g('month')}-${g('day')}`, hour: +(hh + mm / 60).toFixed(4), hh, mm };
+    };
+
+    const heights = new Map<string, TidePoint[]>();
+    const extremes = new Map<string, TideExtreme[]>();
+
+    for (const h of data.heights ?? []) {
+      const { dateStr, hour } = toParts(h.dt);
+      if (!heights.has(dateStr)) heights.set(dateStr, []);
+      heights.get(dateStr)!.push({ hour, height: +h.height.toFixed(3) });
+    }
+    for (const e of data.extremes ?? []) {
+      const { dateStr, hour, hh, mm } = toParts(e.dt);
+      const type: 'High' | 'Low' = e.type === 'High' ? 'High' : 'Low';
+      const timeStr = `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+      if (!extremes.has(dateStr)) extremes.set(dateStr, []);
+      extremes.get(dateStr)!.push({ hour, height: +e.height.toFixed(3), type, timeStr });
+    }
+    console.log('[WorldTides] loaded successfully');
+    return { heights, extremes };
+  } catch (e) {
+    console.error('[WorldTides] fetch failed, falling back to harmonic model:', e);
+    return null;
+  }
+}
+
 // ── Main fetch ────────────────────────────────────────────────────────────────
 
 export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG): Promise<SurfForecastData | null> {
   try {
-    // Tides computed locally via harmonic prediction — no API needed
-    _tideOffset = await fetchTideOffset();
-    const tidesMap = computeIsraelTides();
-
-    // [DEBUG] logs are emitted per-extreme inside computeIsraelTides above.
-    const _todayKey = new Date().toISOString().slice(0, 10);
-    const _firstEx = tidesMap.extremes.get(_todayKey)?.[0];
-    if (_firstEx) {
-      console.log(`[TIDE-SYNC] Final Calculated Tide Time: ${_firstEx.timeStr} (${_firstEx.type}, h=${_firstEx.height}m) | offset=${_tideOffset}h`);
+    // WorldTides = authoritative source; harmonic model = fallback
+    let tidesMap = await fetchWorldTides(lat, lng);
+    const usingWorldTides = tidesMap !== null;
+    if (!tidesMap) {
+      _tideOffset = await fetchTideOffset();
+      tidesMap = computeIsraelTides();
+      const _todayKey = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
+      const _firstEx = tidesMap.extremes.get(_todayKey)?.[0];
+      if (_firstEx) console.log(`[TIDE-SYNC] harmonic fallback: ${_firstEx.timeStr} (${_firstEx.type}) | offset=${_tideOffset}h`);
     }
 
     const [sgHours, isramarBuoy, marineForecastRes, weatherRes, uvRes] = await Promise.all([
@@ -680,7 +733,7 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG): P
       'StormGlass (wind/direction)',
       'Open-Meteo Marine',
       'ECMWF IFS Wind',
-      'Harmonic Tide Model (FES2014/TPXO)',
+      usingWorldTides ? 'WorldTides API (authoritative)' : 'Harmonic Tide Model (FES2014/TPXO — fallback)',
     ];
 
     return {
