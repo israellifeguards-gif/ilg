@@ -381,7 +381,7 @@ async function fetchWorldTides(lat: number, lng: number): Promise<TidesResult | 
     const dateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
     const res = await fetch(
       `https://www.worldtides.info/api/v3?heights&extremes` +
-      `&lat=${lat}&lon=${lng}&key=${key}&date=${dateStr}&days=8&step=900`,
+      `&lat=${lat}&lon=${lng}&key=${key}&date=${dateStr}&days=7&step=900`,
       { next: { revalidate: 43200 } } // 12h cache — free tier is 1 req/day
     );
     if (res.status === 401) { console.error('[WorldTides] 401 invalid key — check WORLDTIDES_API_KEY in Vercel env vars'); return null; }
