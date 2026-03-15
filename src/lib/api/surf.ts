@@ -215,7 +215,7 @@ async function fetchStormGlass(lat: number, lng: number): Promise<SGHour[] | nul
       `&start=${start.toISOString()}&end=${end.toISOString()}`,
       {
         headers: { Authorization: key },
-        next: { revalidate: 10800 }, // 3h → ≤8 req/day
+        next: { revalidate: 10800, tags: [`surf:${lat},${lng}`, 'surf:all'] }, // 3h → ≤8 req/day
       }
     );
     if (!res.ok) return null;
@@ -390,7 +390,7 @@ async function fetchWorldTides(lat: number, lng: number): Promise<TidesResult | 
     const res = await fetch(
       `https://www.worldtides.info/api/v3?extremes` +
       `&lat=${lat}&lon=${lng}&key=${key}&date=${dateStr}&days=7`,
-      { next: { revalidate: 43200 } } // 12h cache — free tier is 1 req/day
+      { next: { revalidate: 43200, tags: [`surf:${lat},${lng}`, 'surf:all'] } } // 12h cache — free tier is 1 req/day
     );
     if (res.status === 401) { console.error('[WorldTides] 401 invalid key — check WORLDTIDES_API_KEY in Vercel env vars'); return null; }
     if (res.status === 429) { console.warn('[WorldTides] 429 quota exceeded — falling back to harmonic model'); return null; }
