@@ -531,7 +531,13 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG): P
     // ── ISRAMAR bias offset — sector-based rolling EMA ───────────────────────
     // Each of 8 wind sectors has an independent EMA stored in Firestore.
     // We read the bias for the current wind sector, then optionally update it.
-    const nowHourIdx = times.findIndex(t => t.startsWith(nowIso));
+    let nowHourIdx = times.findIndex(t => t.startsWith(nowIso));
+    if (nowHourIdx === -1 && times.length > 0) {
+      // Fallback: nearest available entry by wall-clock distance
+      const nowMs = now.getTime();
+      let minDiff = Infinity;
+      times.forEach((t, i) => { const d = Math.abs(new Date(t).getTime() - nowMs); if (d < minDiff) { minDiff = d; nowHourIdx = i; } });
+    }
     const currentWindDir = nowHourIdx >= 0 ? (windDirs[nowHourIdx] ?? 180) : 180;
 
     let waveHeightBiasOffset = await getRollingBias(currentWindDir);
