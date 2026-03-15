@@ -416,8 +416,6 @@ async function fetchWorldTides(lat: number, lng: number): Promise<TidesResult | 
       if (!extremes.has(dateStr)) extremes.set(dateStr, []);
       extremes.get(dateStr)!.push({ hour, height: +e.height.toFixed(3), type, timeStr });
     }
-    const extremeCount = [...extremes.values()].reduce((s, a) => s + a.length, 0);
-    console.log(`[WorldTides] ✓ loaded — ${extremeCount} extremes over 8 days`);
     return { heights, extremes };
   } catch (e) {
     console.error('[WorldTides] unexpected error — falling back to harmonic model:', e);
