@@ -1,5 +1,7 @@
+// force-dynamic is required for cookies() — but individual fetch() calls
+// with revalidate inside fetchSurfForecast still use the Data Cache.
+// We separate Firestore reads (always fresh) from API fetches (cached).
 export const dynamic = 'force-dynamic';
-export const revalidate = 0;
 
 import { SurfForecast } from '@/components/dashboard/SurfForecast';
 import { fetchSurfForecast } from '@/lib/api/surf';
@@ -19,7 +21,7 @@ export default async function DashboardPage({
     ?? BEACHES.find((b) => b.id === favoriteCookie)
     ?? BEACHES.find((b) => b.id === 'tlv')
     ?? BEACHES[0];
-  const surf = await fetchSurfForecast(beach.lat, beach.lng);
+  const surf = await fetchSurfForecast(beach.lat, beach.lng, beach.id);
 
   return (
     <div className="w-full">

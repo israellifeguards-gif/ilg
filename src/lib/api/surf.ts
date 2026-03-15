@@ -1,4 +1,3 @@
-import { unstable_noStore } from 'next/cache';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { db } from '@/lib/firebase/config';
 import { getRollingBias, updateRollingBias } from './buoyBias';
@@ -259,7 +258,9 @@ const _D2R = Math.PI / 180;
 // Per-beach offset path: beaches/{beachId}/tide_settings { offsetHours }
 // Falls back to the legacy global doc (system/tide_settings) so old calibrations still work.
 async function fetchTideOffset(beachId?: string): Promise<number> {
-  unstable_noStore();
+  // No unstable_noStore() — it poisoned the Data Cache for all sibling fetch() calls
+  // (StormGlass revalidate:10800, WorldTides revalidate:43200) in the same request.
+  // Firestore SDK is not a Next.js fetch() call so it's always fresh natively.
   try {
     // 1. Try per-beach offset first
     if (beachId) {
