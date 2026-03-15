@@ -256,23 +256,27 @@ const _D2R = Math.PI / 180;
 // ── Tide offset fetch ────────────────────────────────────────────────────────
 // Firebase SDK calls bypass Next.js fetch cache → always fresh, no revalidate needed.
 // Validation: reject offsets outside ±6h to protect against typos in Firestore.
-async function fetchTideOffset(): Promise<number> {
-  // unstable_noStore() tells Next.js to bypass its in-memory Data Cache
-  // for this entire render, even if revalidate/dynamic are somehow overridden upstream.
+// Per-beach offset path: beaches/{beachId}/tide_settings { offsetHours }
+// Falls back to the legacy global doc (system/tide_settings) so old calibrations still work.
+async function fetchTideOffset(beachId?: string): Promise<number> {
   unstable_noStore();
   try {
-    console.log('[CACHE-CHECK] Reading from Firestore at: ' + new Date().toISOString());
+    // 1. Try per-beach offset first
+    if (beachId) {
+      const beachSnap = await getDoc(doc(db, 'beaches', beachId, 'tide_settings', 'offset'));
+      if (beachSnap.exists()) {
+        const raw = (beachSnap.data() as { offsetHours?: number }).offsetHours ?? 0;
+        if (typeof raw === 'number' && raw >= -6 && raw <= 6) {
+          console.log(`[tide] beach=${beachId} offsetHours=${raw}`);
+          return raw;
+        }
+      }
+    }
+    // 2. Fall back to global legacy offset
     const snap = await getDoc(doc(db, 'system', 'tide_settings'));
-    if (!snap.exists()) {
-      console.log('[tide] no tide_settings doc in Firestore, offset=0');
-      return 0;
-    }
+    if (!snap.exists()) return 0;
     const raw = (snap.data() as { offsetHours?: number }).offsetHours ?? 0;
-    if (typeof raw !== 'number' || raw < -6 || raw > 6) {
-      console.warn(`[tide] offsetHours=${raw} out of ±6h range, using 0`);
-      return 0;
-    }
-    console.log(`[tide] offsetHours=${raw} confirmed fresh from Firestore`);
+    if (typeof raw !== 'number' || raw < -6 || raw > 6) return 0;
     return raw;
   } catch (e) {
     console.error('[tide] failed to fetch tide_settings:', e);
@@ -280,11 +284,14 @@ async function fetchTideOffset(): Promise<number> {
   }
 }
 
-// Write a raw offset value (e.g. from Firestore console or admin panel)
-export async function setTideOffsetRaw(offsetHours: number): Promise<void> {
+// Write per-beach offset. Falls back to global if beachId omitted.
+export async function setTideOffsetRaw(offsetHours: number, beachId?: string): Promise<void> {
   if (offsetHours < -6 || offsetHours > 6) throw new Error('offsetHours must be within ±6h');
-  await setDoc(doc(db, 'system', 'tide_settings'), { offsetHours: +offsetHours.toFixed(3) });
-  console.log(`[tide] offset set to ${offsetHours}h`);
+  const ref = beachId
+    ? doc(db, 'beaches', beachId, 'tide_settings', 'offset')
+    : doc(db, 'system', 'tide_settings');
+  await setDoc(ref, { offsetHours: +offsetHours.toFixed(3) });
+  console.log(`[tide] ${beachId ?? 'global'} offset set to ${offsetHours}h`);
 }
 
 // Calibration utility: provide the actual extreme time and what the app predicted.
@@ -435,17 +442,41 @@ async function fetchWorldTides(lat: number, lng: number): Promise<TidesResult | 
 
 // ── Main fetch ────────────────────────────────────────────────────────────────
 
-export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG): Promise<SurfForecastData | null> {
+export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, beachId?: string): Promise<SurfForecastData | null> {
   try {
     // WorldTides = authoritative source; harmonic model = fallback
     let tidesMap = await fetchWorldTides(lat, lng);
     const usingWorldTides = tidesMap !== null;
+
+    // Per-beach offset shifts the entire tide curve (WorldTides or harmonic)
+    const beachOffset = await fetchTideOffset(beachId);
+
     if (!tidesMap) {
-      _tideOffset = await fetchTideOffset();
+      _tideOffset = beachOffset;
       tidesMap = computeIsraelTides();
       const _todayKey = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
       const _firstEx = tidesMap.extremes.get(_todayKey)?.[0];
       if (_firstEx) console.log(`[TIDE-SYNC] harmonic fallback: ${_firstEx.timeStr} (${_firstEx.type}) | offset=${_tideOffset}h`);
+    } else if (beachOffset !== 0) {
+      // Apply per-beach offset to WorldTides data by shifting all hour values
+      const shiftMap = (map: Map<string, { hour: number; height: number }[]>) => {
+        const shifted = new Map<string, { hour: number; height: number }[]>();
+        map.forEach((pts, date) => shifted.set(date, pts.map(p => ({ ...p, hour: +(p.hour + beachOffset).toFixed(4) }))));
+        return shifted;
+      };
+      tidesMap = {
+        heights: shiftMap(tidesMap.heights) as Map<string, import('@/lib/api/surf').TidePoint[]>,
+        extremes: (() => {
+          const shifted = new Map<string, TideExtreme[]>();
+          tidesMap!.extremes.forEach((exs, date) => shifted.set(date, exs.map(e => {
+            const h = +(e.hour + beachOffset);
+            const hh = Math.floor(((h % 24) + 24) % 24);
+            const mm = Math.round((h - Math.floor(h)) * 60);
+            return { ...e, hour: +h.toFixed(4), timeStr: `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}` };
+          })));
+          return shifted;
+        })(),
+      };
     }
 
     const [sgHours, isramarBuoy, marineForecastRes, weatherRes, uvRes] = await Promise.all([
