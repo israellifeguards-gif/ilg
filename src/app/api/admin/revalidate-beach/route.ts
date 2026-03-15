@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { revalidateTag } from 'next/cache';
+import { updateTag } from 'next/cache';
 import { BEACHES } from '@/lib/beaches';
 
 // Invalidate cached surf data for one beach or all beaches.
@@ -16,7 +16,7 @@ export async function GET(req: Request) {
   }
 
   if (beachId === 'all') {
-    revalidateTag('surf:all');
+    updateTag('surf:all');
     return NextResponse.json({ ok: true, invalidated: 'all beaches' });
   }
 
@@ -25,6 +25,6 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: `unknown beach: ${beachId}` }, { status: 404 });
   }
 
-  revalidateTag(`surf:${beach.lat},${beach.lng}`);
+  updateTag(`surf:${beach.lat},${beach.lng}`);
   return NextResponse.json({ ok: true, invalidated: beachId, lat: beach.lat, lng: beach.lng });
 }
