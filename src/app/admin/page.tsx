@@ -3,14 +3,33 @@
 import { useState, useEffect, useCallback } from 'react';
 import { getPendingUsers, getJobs, setGlobalAlert, deleteJob, updateUser, deleteUser } from '@/lib/firebase/firestore';
 import { UserQueue } from '@/components/admin/UserQueue';
+import { BeachCalibrationPanel } from '@/components/admin/BeachCalibrationPanel';
 import type { ILGUser, Job } from '@/types';
 
 // Simple admin guard — replace with proper auth check in production
 const ADMIN_PASSWORD = 'ilg-admin-2024';
+const ADMIN_KEY   = 'ilg_admin_mode';
+const ADMIN_EVENT = 'ilg-admin-mode-change';
+
+function setAdminMode(active: boolean) {
+  if (active) sessionStorage.setItem(ADMIN_KEY, '1');
+  else sessionStorage.removeItem(ADMIN_KEY);
+  window.dispatchEvent(new CustomEvent(ADMIN_EVENT));
+}
 
 export default function AdminPage() {
-  const [authed, setAuthed] = useState(false);
+  const [authed, setAuthedState] = useState(false);
   const [password, setPassword] = useState('');
+
+  // Restore session on mount (survives navigation within same tab)
+  useEffect(() => {
+    if (sessionStorage.getItem(ADMIN_KEY) === '1') setAuthedState(true);
+  }, []);
+
+  function setAuthed(v: boolean) {
+    setAuthedState(v);
+    setAdminMode(v);
+  }
   const [users, setUsers] = useState<ILGUser[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [alertMsg, setAlertMsg] = useState('');
@@ -76,7 +95,7 @@ export default function AdminPage() {
           onClick={() => setAuthed(false)}
           className="text-xs text-gray-500 hover:text-black underline"
         >
-          התנתק
+          צא ממצב מנהל
         </button>
       </div>
 
@@ -186,6 +205,24 @@ export default function AdminPage() {
             ))}
           </ul>
         )}
+      </section>
+
+      {/* Beach Calibration */}
+      <section className="space-y-3">
+        <h2 className="font-black text-base flex items-center gap-2">
+          🌊 כיול חופים
+          <span className="text-xs font-normal text-gray-400">height · period · wind · swell angle</span>
+        </h2>
+        <div className="border border-gray-200 p-4">
+          <BeachCalibrationPanel />
+        </div>
+        <div className="text-xs text-gray-500 space-y-1">
+          <p><strong>Hs ×</strong> — מכפיל גובה הגל (1.0 = ללא תיקון, 1.25 = הגדל ב-25%)</p>
+          <p><strong>T ×</strong> — מכפיל תקופת הגל (1.0 = ללא תיקון)</p>
+          <p><strong>Wind kn</strong> — הוספה/הפחתה לעוצמת הרוח בנוטס (0 = ללא תיקון)</p>
+          <p><strong>Angle °</strong> — הזחה לזווית החוף האפקטיבית (285° + offset). נגטיב = פנייה דרומה</p>
+          <p><strong>P kW/m</strong> — עוצמת הגל בתצוגה מקדימה: P = 0.4903 × Hs² × T</p>
+        </div>
       </section>
     </div>
   );

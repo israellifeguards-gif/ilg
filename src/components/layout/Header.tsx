@@ -8,9 +8,13 @@ import { auth } from '@/lib/firebase/config';
 import { getUser } from '@/lib/firebase/firestore';
 import { useRouter } from 'next/navigation';
 
+const ADMIN_KEY   = 'ilg_admin_mode';
+const ADMIN_EVENT = 'ilg-admin-mode-change';
+
 export function Header() {
   const [loggedIn, setLoggedIn] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [isAdminMode, setIsAdminMode] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
   const [hasNewUpdate, setHasNewUpdate] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -39,6 +43,14 @@ export function Header() {
     return () => unsub();
   }, []);
 
+  // Sync admin-mode badge with sessionStorage (set by /admin page)
+  useEffect(() => {
+    setIsAdminMode(sessionStorage.getItem(ADMIN_KEY) === '1');
+    const sync = () => setIsAdminMode(sessionStorage.getItem(ADMIN_KEY) === '1');
+    window.addEventListener(ADMIN_EVENT, sync);
+    return () => window.removeEventListener(ADMIN_EVENT, sync);
+  }, []);
+
   useEffect(() => {
     function handleClick(e: MouseEvent) {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
@@ -51,8 +63,16 @@ export function Header() {
 
   async function handleLogout() {
     await signOut(auth);
+    sessionStorage.removeItem(ADMIN_KEY);
+    window.dispatchEvent(new CustomEvent(ADMIN_EVENT));
     setShowMenu(false);
     router.push('/login');
+  }
+
+  function handleExitAdmin() {
+    sessionStorage.removeItem(ADMIN_KEY);
+    window.dispatchEvent(new CustomEvent(ADMIN_EVENT));
+    setShowMenu(false);
   }
 
   return (
@@ -105,13 +125,34 @@ export function Header() {
             <>
               <button
                 onClick={() => setShowMenu(v => !v)}
-                className="px-4 py-2 text-sm font-black bg-green-600 text-white hover:bg-green-700 transition-colors"
+                className={`px-4 py-2 text-sm font-black text-white transition-colors ${
+                  isAdminMode
+                    ? 'bg-pink-500 hover:bg-pink-600'
+                    : 'bg-green-600 hover:bg-green-700'
+                }`}
               >
-                מחובר
+                {isAdminMode ? 'מנהל' : 'מחובר'}
               </button>
               {showMenu && (
-                <div className="absolute left-0 top-10 bg-white rounded-xl shadow-2xl overflow-hidden z-50" style={{ minWidth: 160 }}>
-                  {isAdmin && (
+                <div className="absolute left-0 top-10 bg-white rounded-xl shadow-2xl overflow-hidden z-50" style={{ minWidth: 175 }}>
+                  {isAdminMode && (
+                    <>
+                      <Link
+                        href="/admin"
+                        onClick={() => setShowMenu(false)}
+                        className="w-full px-5 py-3 text-sm font-black text-pink-500 hover:bg-pink-50 transition-colors text-right block"
+                      >
+                        פאנל ניהול
+                      </Link>
+                      <button
+                        onClick={handleExitAdmin}
+                        className="w-full px-5 py-3 text-sm font-black text-gray-400 hover:bg-gray-50 transition-colors text-right block"
+                      >
+                        צא ממצב מנהל
+                      </button>
+                    </>
+                  )}
+                  {isAdmin && !isAdminMode && (
                     <Link
                       href="/admin"
                       onClick={() => setShowMenu(false)}

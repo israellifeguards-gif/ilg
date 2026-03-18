@@ -17,9 +17,13 @@ const navItems = [
   { href: '/login', label: 'כניסה', isLogin: true },
 ];
 
+const ADMIN_KEY   = 'ilg_admin_mode';
+const ADMIN_EVENT = 'ilg-admin-mode-change';
+
 export function MobileNav() {
   const [loggedIn, setLoggedIn] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [isAdminMode, setIsAdminMode] = useState(false);
   const [showLogout, setShowLogout] = useState(false);
   const [hasNewUpdate, setHasNewUpdate] = useState(false);
   const popupRef = useRef<HTMLDivElement>(null);
@@ -58,10 +62,25 @@ export function MobileNav() {
     return () => document.removeEventListener('mousedown', handleClick);
   }, []);
 
+  useEffect(() => {
+    setIsAdminMode(sessionStorage.getItem(ADMIN_KEY) === '1');
+    const sync = () => setIsAdminMode(sessionStorage.getItem(ADMIN_KEY) === '1');
+    window.addEventListener(ADMIN_EVENT, sync);
+    return () => window.removeEventListener(ADMIN_EVENT, sync);
+  }, []);
+
   async function handleLogout() {
     await signOut(auth);
+    sessionStorage.removeItem(ADMIN_KEY);
+    window.dispatchEvent(new CustomEvent(ADMIN_EVENT));
     setShowLogout(false);
     router.push('/login');
+  }
+
+  function handleExitAdmin() {
+    sessionStorage.removeItem(ADMIN_KEY);
+    window.dispatchEvent(new CustomEvent(ADMIN_EVENT));
+    setShowLogout(false);
   }
 
   return (
@@ -116,9 +135,26 @@ export function MobileNav() {
                   {loggedIn && showLogout && (
                     <div
                       className="absolute bottom-12 left-1/2 -translate-x-1/2 bg-white rounded-xl shadow-2xl overflow-hidden z-50"
-                      style={{ minWidth: 150 }}
+                      style={{ minWidth: 165 }}
                     >
-                      {isAdmin && (
+                      {isAdminMode && (
+                        <>
+                          <Link
+                            href="/admin"
+                            onClick={() => setShowLogout(false)}
+                            className="w-full px-5 py-3 text-sm font-black text-pink-500 hover:bg-pink-50 transition-colors text-center block"
+                          >
+                            פאנל ניהול
+                          </Link>
+                          <button
+                            onClick={handleExitAdmin}
+                            className="w-full px-5 py-3 text-sm font-black text-gray-400 hover:bg-gray-50 transition-colors text-center block"
+                          >
+                            צא ממצב מנהל
+                          </button>
+                        </>
+                      )}
+                      {isAdmin && !isAdminMode && (
                         <Link
                           href="/admin"
                           onClick={() => setShowLogout(false)}
@@ -139,9 +175,13 @@ export function MobileNav() {
                   {loggedIn ? (
                     <button
                       onClick={() => setShowLogout(v => !v)}
-                      className="text-white bg-green-600 rounded-lg px-3 py-2 font-black text-sm hover:bg-green-700 transition-colors"
+                      className={`rounded-lg px-3 py-2 font-black text-sm text-white transition-colors ${
+                        isAdminMode
+                          ? 'bg-pink-500 hover:bg-pink-600'
+                          : 'bg-green-600 hover:bg-green-700'
+                      }`}
                     >
-                      מחובר
+                      {isAdminMode ? 'מנהל' : 'מחובר'}
                     </button>
                   ) : (
                     <Link
