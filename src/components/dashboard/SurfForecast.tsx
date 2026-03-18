@@ -401,7 +401,11 @@ export function SurfForecast({ data, beachName, selectedBeachId, hasExplicitCity
         </div>
         <div className="flex items-center gap-2 mb-2">
           <BeachSelector selected={selectedBeachId ?? 'tlv'} hasExplicitCity={hasExplicitCity ?? false} isDark={isDark} />
-          <div className="hidden md:block text-xs" style={{ color: t.txt2 }}>עודכן {fetchTime} · {data.sources.join(' · ')}</div>
+          <div className="hidden md:block text-xs" style={{ color: t.txt2 }}>
+            עודכן {fetchTime}
+            {!data.buoyLive && <span title="המצוף לא זמין — תחזית מבוססת מודל בלבד"> · ⚠️ מודל בלבד</span>}
+            {' · '}{data.sources.join(' · ')}
+          </div>
         </div>
         <div className="flex items-center gap-2 mb-3">
           <button

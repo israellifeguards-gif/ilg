@@ -1,6 +1,7 @@
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { db } from '@/lib/firebase/config';
 import { getRollingBias, updateRollingBias } from './buoyBias';
+import { fetchBeachCalibration, BeachCalibration, CAL_DEFAULTS } from './beachCalibration';
 
 const DEFAULT_LAT = 32.08;
 const DEFAULT_LNG = 34.77;
@@ -15,6 +16,7 @@ function degreesToCompass(deg: number): string {
 // - Offshore (east, 90-130°): ×1.1 — wind blows off land, sea surface is cleaner
 // - All other directions: ×1.5 — onshore/cross-shore adds chop and gusts
 function adjustWind(kts: number, dir = 180): number {
+  if (!isFinite(kts) || kts < 0) return 0;
   const isOffshore = dir >= 90 && dir <= 130;
   return Math.round(kts * (isOffshore ? 1.1 : 1.5));
 }
@@ -23,28 +25,99 @@ function adjustWind(kts: number, dir = 180): number {
 // Uses RMS of swell + wind-sea when both are available.
 // Falls back to totalHs/2 when windWaveHs is 0 (e.g. ecmwf_wam025 doesn't
 // always return wind_wave_height — without it the formula would crush values).
-function calcEffectiveWaveHeight(swellHs: number, windWaveHs: number, totalHs: number): number {
-  if (windWaveHs > 0 && swellHs > 0) {
-    return +( Math.sqrt(Math.pow(swellHs * 1.2, 2) + Math.pow(windWaveHs * 0.6, 2)) / 2 ).toFixed(1);
+//
+// buoyFaceH (optional): real-time ISRAMAR face height (buoyHs / 2).
+// When the sea exceeds 2 m Hs the spectral formula underestimates breaking-wave
+// height because grid models smooth out swell peaks. In that regime we blend
+// 80% buoy (measured) + 20% model (direction/period signal) — buoy is only
+// available for current conditions; hourly forecasts call without it.
+function calcEffectiveWaveHeight(swellHs: number, windWaveHs: number, totalHs: number, buoyFaceH?: number): number {
+  // Guard: clamp non-finite inputs to safe values
+  const safeSwellHs    = isFinite(swellHs)    && swellHs    >= 0 ? swellHs    : 0;
+  const safeWindWaveHs = isFinite(windWaveHs)  && windWaveHs >= 0 ? windWaveHs : 0;
+  const safeTotalHs    = isFinite(totalHs)    && totalHs    >= 0 ? totalHs    : 0;
+
+  const modelFaceH = safeWindWaveHs > 0 && safeSwellHs > 0
+    ? +( Math.sqrt(Math.pow(safeSwellHs * 1.2, 2) + Math.pow(safeWindWaveHs * 0.6, 2)) / 2 ).toFixed(1)
+    : +(safeTotalHs / 2).toFixed(1);
+
+  if (buoyFaceH !== undefined && isFinite(buoyFaceH) && buoyFaceH >= 0 && safeTotalHs >= 2) {
+    // Rough sea: buoy measurement dominates — model keeps spectral shape signal
+    return +(buoyFaceH * 0.8 + modelFaceH * 0.2).toFixed(1);
   }
-  // Fallback: use total wave height (simple face height)
-  return +(totalHs / 2).toFixed(1);
+  return modelFaceH;
+}
+
+// ── Wave energy (oceanographic standard) ─────────────────────────────────────
+// Wave power (energy flux per metre of wave crest, deep-water approximation):
+//   P = ρ · g² · Hs² · T / (64π)   [W/m]
+// With ρ = 1025 kg/m³, g = 9.81 m/s²:
+//   P ≈ 0.4903 × Hs² × T   [kW/m]
+// Uses calibrated Hs and period so the value reflects what surfers actually see.
+export function calcWaveEnergy(calHs: number, calPeriod: number): number {
+  if (!isFinite(calHs) || !isFinite(calPeriod) || calHs < 0 || calPeriod <= 0) return 0;
+  return +(0.4903 * calHs * calHs * calPeriod).toFixed(2); // kW/m
+}
+
+// ── Safe wrappers ─────────────────────────────────────────────────────────────
+// Return null (not NaN/Infinity) on bad inputs or thrown exceptions.
+// Callers use `?? fallback` so the UI always receives a valid number.
+// beachId is included in every error log so Vercel logs pinpoint the beach.
+
+export function safeCalcWaveHeight(
+  swellHs: number, windWaveHs: number, totalHs: number,
+  buoyFaceH: number | undefined, beachId?: string,
+): number | null {
+  try {
+    if (!isFinite(swellHs) || !isFinite(windWaveHs) || !isFinite(totalHs)) {
+      console.error(`[surf] safeCalcWaveHeight: non-finite input beach=${beachId}`, { swellHs, windWaveHs, totalHs });
+      return null;
+    }
+    const result = calcEffectiveWaveHeight(swellHs, windWaveHs, totalHs, buoyFaceH);
+    if (!isFinite(result)) {
+      console.error(`[surf] safeCalcWaveHeight: result=${result} beach=${beachId}`, { swellHs, windWaveHs, totalHs });
+      return null;
+    }
+    return result;
+  } catch (e) {
+    console.error(`[surf] safeCalcWaveHeight threw beach=${beachId}:`, e);
+    return null;
+  }
+}
+
+export function safeCalcWaveEnergy(calHs: number, calPeriod: number, beachId?: string): number | null {
+  try {
+    if (!isFinite(calHs) || !isFinite(calPeriod) || calHs < 0 || calPeriod <= 0) {
+      console.error(`[surf] safeCalcWaveEnergy: invalid input beach=${beachId}`, { calHs, calPeriod });
+      return null;
+    }
+    const result = calcWaveEnergy(calHs, calPeriod);
+    if (!isFinite(result)) {
+      console.error(`[surf] safeCalcWaveEnergy: result=${result} beach=${beachId}`);
+      return null;
+    }
+    return result;
+  } catch (e) {
+    console.error(`[surf] safeCalcWaveEnergy threw beach=${beachId}:`, e);
+    return null;
+  }
 }
 
 // ── Coastline correction ──────────────────────────────────────────────────────
 // Israel's Mediterranean coast faces ~285° (WNW).
-// A swell hitting perpendicular (from 285°) gets full energy.
-// Oblique swells lose energy proportional to cos(angle difference).
-// Returns a multiplier 0.0–1.0.
-function coastlineCorrection(waveDeg: number): number {
-  const COAST_FACING = 285; // degrees the coast faces (toward sea)
+// swell_angle_offset shifts the effective coast-facing direction per beach
+// (e.g. Ashdod faces slightly south → negative offset; Haifa → positive).
+function coastlineCorrection(waveDeg: number, coastOffset = 0): number {
+  if (!isFinite(waveDeg)) return 0;
+  const COAST_FACING = 285 + (isFinite(coastOffset) ? coastOffset : 0);
   const diff = Math.abs(((waveDeg - COAST_FACING + 180 + 360) % 360) - 180);
-  if (diff >= 90) return 0; // swell coming from land side — no waves
+  if (diff >= 90) return 0;
   return Math.cos((diff * Math.PI) / 180);
 }
 
-export function calcRating(waveHeight: number, wavePeriod: number, windSpeed: number, waveDeg = 270, windDir = 180): number {
-  const correction = coastlineCorrection(waveDeg);
+export function calcRating(waveHeight: number, wavePeriod: number, windSpeed: number, waveDeg = 270, windDir = 180, coastOffset = 0): number {
+  if (!isFinite(waveHeight) || !isFinite(wavePeriod) || !isFinite(windSpeed)) return 1;
+  const correction = coastlineCorrection(waveDeg, coastOffset);
   const effectiveHeight = waveHeight * correction;
   const isOffshore = windDir >= 90 && windDir <= 130;
 
@@ -81,6 +154,8 @@ export interface SurfCurrent {
   waterTemp: number;
   uvIndex: number;
   rating: number;
+  /** Wave power in kW/m — P = 0.4903 × Hs² × T, uses calibrated values */
+  waveEnergy: number;
 }
 
 export interface SurfHour {
@@ -94,6 +169,8 @@ export interface SurfHour {
   windDir: string;
   windDeg: number;
   rating: number;
+  /** Wave power in kW/m */
+  waveEnergy: number;
 }
 
 export interface SurfDay {
@@ -135,6 +212,22 @@ export interface SurfForecastData {
   sunset: string;
   firstLight: string;
   lastLight: string;
+  /** true = ISRAMAR buoy passed validation and was blended into wave height */
+  buoyLive: boolean;
+  /** Active calibration factors for this beach (for admin display + observation submission) */
+  calibration: BeachCalibration;
+  /**
+   * 0–100 data-quality score for this forecast.
+   *
+   * Component breakdown:
+   *   30  — baseline (Open-Meteo always available)
+   *   +35 — buoyLive: ISRAMAR measured Hs blended in (vs pure model)
+   *   +25 — WorldTides used for tides (vs harmonic fallback)
+   *   +10 — beach actively calibrated (any factor differs from default)
+   *
+   * Use this to show a confidence indicator in the UI or log-based alerting.
+   */
+  confidenceScore: number;
 }
 
 // ── ISRAMAR Hadera Buoy ───────────────────────────────────────────────────────
@@ -166,6 +259,73 @@ async function fetchIsramarBuoy(): Promise<IsramarBuoy | null> {
     };
   } catch {
     return null;
+  }
+}
+
+// ── Buoy sanity check ─────────────────────────────────────────────────────────
+// Rejects physically implausible readings before they reach the display layer.
+// Mediterranean physical limits: Hs ≤ 10 m, T ∈ [2, 25] s, freshness ≤ 3 h.
+function validateIsramarBuoy(buoy: IsramarBuoy): boolean {
+  if (buoy.waveHeight < 0.05 || buoy.waveHeight > 10) {
+    console.warn(`[buoy-validate] rejected: waveHeight=${buoy.waveHeight}m (range 0.05–10)`);
+    return false;
+  }
+  if (buoy.wavePeriod < 2 || buoy.wavePeriod > 25) {
+    console.warn(`[buoy-validate] rejected: wavePeriod=${buoy.wavePeriod}s (range 2–25)`);
+    return false;
+  }
+  if (buoy.maxWaveHeight > 15) {
+    console.warn(`[buoy-validate] rejected: maxWaveHeight=${buoy.maxWaveHeight}m > 15`);
+    return false;
+  }
+  // Freshness: datetime arrives as "2026-03-15 13:00 UTC"
+  try {
+    const buoyTime = new Date(buoy.datetime.replace(' ', 'T').replace(' UTC', 'Z'));
+    const ageH = (Date.now() - buoyTime.getTime()) / 3_600_000;
+    if (ageH > 3) {
+      console.warn(`[buoy-validate] rejected: data is ${ageH.toFixed(1)}h old`);
+      return false;
+    }
+  } catch {
+    console.warn('[buoy-validate] rejected: unparseable datetime', buoy.datetime);
+    return false;
+  }
+  return true;
+}
+
+// ── Buoy EMA smoothing ────────────────────────────────────────────────────────
+// Stores a rolling EMA of Hs in Firestore so a single spike reading doesn't
+// cause the UI number to jump. α = 0.35 → ~3 readings (3 h) to fully reflect
+// a sustained change. Rate-limited to 1 Firestore write/hour — same pattern
+// as buoyBias.ts. Falls back to raw reading on any error.
+
+const _BUOY_EMA_ALPHA        = 0.35;
+const _BUOY_EMA_MAX_AGE_MS   = 6 * 3_600_000; // discard EMA if server was idle > 6 h
+const _BUOY_EMA_MIN_WRITE_MS = 3_600_000;      // max 1 write/hr (matches buoy update cadence)
+
+async function getSmoothedBuoyHeight(rawHs: number): Promise<number> {
+  try {
+    const ref = doc(db, 'system', 'buoy_wave_ema');
+    const snap = await getDoc(ref);
+    const now = Date.now();
+
+    if (snap.exists()) {
+      const { emaHeight, updatedAt } = snap.data() as { emaHeight: number; updatedAt: number };
+      if (typeof emaHeight === 'number' && now - updatedAt < _BUOY_EMA_MAX_AGE_MS) {
+        const newEma = _BUOY_EMA_ALPHA * rawHs + (1 - _BUOY_EMA_ALPHA) * emaHeight;
+        console.log(`[buoy-ema] raw=${rawHs.toFixed(2)} prev=${emaHeight.toFixed(2)} → ema=${newEma.toFixed(2)}`);
+        // Rate-limited write — non-blocking
+        if (now - updatedAt >= _BUOY_EMA_MIN_WRITE_MS) {
+          setDoc(ref, { emaHeight: +newEma.toFixed(3), updatedAt: now }).catch(() => null);
+        }
+        return newEma;
+      }
+    }
+    // First reading or stale — seed with current value
+    setDoc(ref, { emaHeight: +rawHs.toFixed(3), updatedAt: now }).catch(() => null);
+    return rawHs;
+  } catch {
+    return rawHs; // never block the forecast on EMA failure
   }
 }
 
@@ -369,12 +529,212 @@ function computeIsraelTides(): TidesResult {
     const rawMs = (rawEpochHours - _tideOffset) * 3_600_000;
     const rawLocal = parts(new Date(rawMs));
     const rawTimeStr = `${String(rawLocal.hh).padStart(2, '0')}:${String(rawLocal.mm).padStart(2, '0')}`;
-    console.log(`[DEBUG] Applying Offset: ${_tideOffset}h to Raw Time: ${rawTimeStr} → Final: ${timeStr} (${type})`);
     if (!extremes.has(dateStr)) extremes.set(dateStr, []);
     extremes.get(dateStr)!.push({ hour, height: +_tideH(exactMs).toFixed(3), type, timeStr });
   }
 
   return { heights, extremes };
+}
+
+// ── Debug utility ─────────────────────────────────────────────────────────────
+// Prints raw API values vs final displayed values for one beach.
+// Safe to call in production — read-only, no side effects.
+// Usage: GET /api/admin/debug-surf?beach=tlv
+
+export interface SurfDebugReport {
+  beachId: string;
+  beachOffset: number;
+  usingWorldTides: boolean;
+  tide: {
+    rawExtremes: { type: string; rawTimeStr: string; height: number }[];
+    shiftedExtremes: { type: string; shiftedTimeStr: string; height: number }[];
+  };
+  waves: {
+    isramarRaw: { waveHeight: number; wavePeriod: number; maxWaveHeight: number; datetime: string } | null;
+    isramarDisplayed: number | null; // isramarBuoy.waveHeight / 2
+    openMeteoCurrentRaw: { wave_height: number; wind_wave_height: number; swell_wave_height: number } | null;
+    biasOffset: number;
+    biasOffsetSource: string;
+    effectiveWaveHeightFormula: string;
+    effectiveWaveHeightResult: number | null;
+  };
+  wind: {
+    openMeteoRawKnots: number;
+    rawDir: number;
+    isOffshore: boolean;
+    multiplier: number;
+    displayedKnots: number;
+  } | null;
+  swellHeight: {
+    rawFromAPI: number;
+    halvedForDisplay: number;
+  } | null;
+}
+
+export async function debugTideData(beachId: string): Promise<SurfDebugReport> {
+  const { BEACHES } = await import('@/lib/beaches');
+  const beach = BEACHES.find(b => b.id === beachId) ?? { lat: DEFAULT_LAT, lng: DEFAULT_LNG, id: beachId };
+  const { lat, lng } = beach;
+
+  // 1. Tide offset
+  const beachOffset = await fetchTideOffset(beachId);
+
+  // 2. WorldTides raw extremes
+  const wtKey = process.env.WORLDTIDES_API_KEY;
+  let rawWorldTidesExtremes: { type: string; rawTimeStr: string; height: number }[] = [];
+  let shiftedExtremes: { type: string; shiftedTimeStr: string; height: number }[] = [];
+  let usingWorldTides = false;
+
+  if (wtKey) {
+    const dateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
+    const res = await fetch(
+      `https://www.worldtides.info/api/v3?extremes&lat=${lat}&lon=${lng}&key=${wtKey}&date=${dateStr}&days=2`,
+      { cache: 'no-store' }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      usingWorldTides = data.status === 200;
+      const TZ = 'Asia/Jerusalem';
+      for (const e of data.extremes ?? []) {
+        const raw = new Date(e.dt * 1000);
+        const rawParts = new Intl.DateTimeFormat('en-CA', {
+          timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false,
+        }).formatToParts(raw);
+        const rg = (t: string) => rawParts.find(x => x.type === t)?.value ?? '0';
+        const rawTimeStr = `${(parseInt(rg('hour')) % 24).toString().padStart(2, '0')}:${rg('minute')}`;
+
+        const shiftedDt = e.dt + beachOffset * 3600;
+        const shiftedParts = new Intl.DateTimeFormat('en-CA', {
+          timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false,
+        }).formatToParts(new Date(shiftedDt * 1000));
+        const sg = (t: string) => shiftedParts.find(x => x.type === t)?.value ?? '0';
+        const shiftedTimeStr = `${(parseInt(sg('hour')) % 24).toString().padStart(2, '0')}:${sg('minute')}`;
+
+        rawWorldTidesExtremes.push({ type: e.type, rawTimeStr, height: +e.height.toFixed(3) });
+        shiftedExtremes.push({ type: e.type, shiftedTimeStr, height: +e.height.toFixed(3) });
+      }
+    }
+  }
+
+  // 3. ISRAMAR buoy
+  const buoy = await fetchIsramarBuoy();
+  const isramarDisplayed = buoy ? +(buoy.waveHeight / 2).toFixed(2) : null;
+
+  // 4. Open-Meteo Marine current (raw)
+  let openMeteoRaw: SurfDebugReport['waves']['openMeteoCurrentRaw'] = null;
+  try {
+    const r = await fetch(
+      `https://marine-api.open-meteo.com/v1/marine` +
+      `?latitude=${lat}&longitude=${lng}` +
+      `&current=wave_height,wind_wave_height,swell_wave_height`,
+      { cache: 'no-store' }
+    );
+    if (r.ok) {
+      const d = await r.json();
+      const c = d.current ?? {};
+      openMeteoRaw = {
+        wave_height: +(c.wave_height ?? 0).toFixed(3),
+        wind_wave_height: +(c.wind_wave_height ?? 0).toFixed(3),
+        swell_wave_height: +(c.swell_wave_height ?? 0).toFixed(3),
+      };
+    }
+  } catch { /* ignore */ }
+
+  // 5. Bias offset
+  const now = new Date();
+  const _ilParts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Jerusalem', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', hour12: false,
+  }).formatToParts(now);
+  const _ilGet = (type: string) => _ilParts.find(p => p.type === type)?.value ?? '0';
+  const nowIsoDebug = `${_ilGet('year')}-${_ilGet('month')}-${_ilGet('day')}T${(parseInt(_ilGet('hour')) % 24).toString().padStart(2, '0')}`;
+
+  let biasOffset = 0;
+  let biasOffsetSource = 'Firestore rolling EMA (sector-based)';
+  let currentWindDir = 180;
+  try {
+    const wRes = await fetch(
+      `https://api.open-meteo.com/v1/forecast` +
+      `?latitude=${lat}&longitude=${lng}&current=wind_direction_10m&models=ecmwf_ifs025&timezone=Asia%2FJerusalem`,
+      { cache: 'no-store' }
+    );
+    if (wRes.ok) {
+      const wd = await wRes.json();
+      currentWindDir = wd.current?.wind_direction_10m ?? 180;
+    }
+  } catch { /* ignore */ }
+  biasOffset = await getRollingBias(currentWindDir);
+  if (buoy && openMeteoRaw) {
+    const liveError = buoy.waveHeight - openMeteoRaw.wave_height;
+    biasOffset = biasOffset * 0.7 + liveError * 0.3;
+    biasOffset = Math.max(-0.8, Math.min(0.8, biasOffset));
+    biasOffsetSource = 'Firestore EMA×0.7 + live ISRAMAR error×0.3 (blended)';
+  }
+
+  // 6. Effective wave height formula result
+  let effectiveWaveHeightResult: number | null = null;
+  const formulaStr = 'sqrt((swellH×1.2)² + (windWaveH×0.6)²) / 2  —or—  totalHs÷2 fallback';
+  if (openMeteoRaw) {
+    const swellH = openMeteoRaw.swell_wave_height;
+    const windWaveH = openMeteoRaw.wind_wave_height;
+    const totalHs = openMeteoRaw.wave_height + biasOffset;
+    effectiveWaveHeightResult = calcEffectiveWaveHeight(swellH, windWaveH, totalHs);
+  }
+
+  // 7. Wind
+  let windDebug: SurfDebugReport['wind'] = null;
+  try {
+    const wRes = await fetch(
+      `https://api.open-meteo.com/v1/forecast` +
+      `?latitude=${lat}&longitude=${lng}&current=wind_speed_10m,wind_direction_10m&wind_speed_unit=kn&models=ecmwf_ifs025&timezone=Asia%2FJerusalem`,
+      { cache: 'no-store' }
+    );
+    if (wRes.ok) {
+      const wd = await wRes.json();
+      const rawKnots = +(wd.current?.wind_speed_10m ?? 0).toFixed(1);
+      const rawDir = +(wd.current?.wind_direction_10m ?? 180);
+      const isOffshore = rawDir >= 90 && rawDir <= 130;
+      const multiplier = isOffshore ? 1.1 : 1.5;
+      windDebug = {
+        openMeteoRawKnots: rawKnots,
+        rawDir,
+        isOffshore,
+        multiplier,
+        displayedKnots: Math.round(rawKnots * multiplier),
+      };
+    }
+  } catch { /* ignore */ }
+
+  // 8. Swell height halving
+  const swellDebug = openMeteoRaw ? {
+    rawFromAPI: openMeteoRaw.swell_wave_height,
+    halvedForDisplay: +(openMeteoRaw.swell_wave_height / 2).toFixed(2),
+  } : null;
+
+  const report: SurfDebugReport = {
+    beachId,
+    beachOffset,
+    usingWorldTides,
+    tide: {
+      rawExtremes: rawWorldTidesExtremes.slice(0, 6),
+      shiftedExtremes: shiftedExtremes.slice(0, 6),
+    },
+    waves: {
+      isramarRaw: buoy,
+      isramarDisplayed,
+      openMeteoCurrentRaw: openMeteoRaw,
+      biasOffset: +biasOffset.toFixed(3),
+      biasOffsetSource,
+      effectiveWaveHeightFormula: formulaStr,
+      effectiveWaveHeightResult,
+    },
+    wind: windDebug,
+    swellHeight: swellDebug,
+  };
+
+  // Log to server console for easy inspection
+  console.log('[debugTideData] report:', JSON.stringify(report, null, 2));
+  return report;
 }
 
 // ── WorldTides API ────────────────────────────────────────────────────────────
@@ -385,6 +745,8 @@ function computeIsraelTides(): TidesResult {
 async function fetchWorldTides(lat: number, lng: number): Promise<TidesResult | null> {
   const key = process.env.WORLDTIDES_API_KEY;
   if (!key) { console.warn('[WorldTides] no API key — using harmonic fallback'); return null; }
+  // Log key presence (never the value) so Vercel logs confirm env var is wired
+  console.log(`[WorldTides] key present (${key.length} chars), requesting lat=${lat} lon=${lng}`);
   try {
     const dateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
     const res = await fetch(
@@ -392,11 +754,14 @@ async function fetchWorldTides(lat: number, lng: number): Promise<TidesResult | 
       `&lat=${lat}&lon=${lng}&key=${key}&date=${dateStr}&days=7`,
       { next: { revalidate: 43200, tags: [`surf:${lat},${lng}`, 'surf:all'] } } // 12h cache — free tier is 1 req/day
     );
-    if (res.status === 401) { console.error('[WorldTides] 401 invalid key — check WORLDTIDES_API_KEY in Vercel env vars'); return null; }
+    // Always log status so we can distinguish 401 / 429 / 200 in Vercel logs
+    console.log(`[WorldTides] HTTP ${res.status}`);
+    if (res.status === 401) { console.error('[WorldTides] 401 — WORLDTIDES_API_KEY is set but rejected. Check the key in Vercel → Settings → Environment Variables.'); return null; }
     if (res.status === 429) { console.warn('[WorldTides] 429 quota exceeded — falling back to harmonic model'); return null; }
-    if (!res.ok) { console.error(`[WorldTides] HTTP ${res.status} — falling back to harmonic model`); return null; }
+    if (!res.ok) { console.warn(`[WorldTides] HTTP ${res.status} — falling back to harmonic model`); return null; }
     const data = await res.json();
     if (data.status !== 200) { console.warn('[WorldTides] API error:', data.error, '— falling back'); return null; }
+    console.log(`[WorldTides] OK — ${data.extremes?.length ?? 0} extremes loaded (callsRemaining=${data.callsRemaining ?? '?'})`);
 
     const TZ = 'Asia/Jerusalem';
     const toParts = (dt: number) => {
@@ -445,12 +810,17 @@ async function fetchWorldTides(lat: number, lng: number): Promise<TidesResult | 
 
 export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, beachId?: string): Promise<SurfForecastData | null> {
   try {
-    // WorldTides = authoritative source; harmonic model = fallback
-    let tidesMap = await fetchWorldTides(lat, lng);
-    const usingWorldTides = tidesMap !== null;
+    // All three Firestore reads in parallel — none depends on each other
+    const NO_CAL: BeachCalibration = { ...CAL_DEFAULTS };
+    const [_tidesResult, beachOffset, calibration] = await Promise.all([
+      fetchWorldTides(lat, lng),
+      fetchTideOffset(beachId),
+      beachId ? fetchBeachCalibration(beachId) : Promise.resolve(NO_CAL),
+    ]);
 
-    // Per-beach offset shifts the entire tide curve (WorldTides or harmonic)
-    const beachOffset = await fetchTideOffset(beachId);
+    // WorldTides = authoritative source; harmonic model = fallback
+    let tidesMap = _tidesResult;
+    const usingWorldTides = tidesMap !== null;
 
     if (!tidesMap) {
       _tideOffset = beachOffset;
@@ -522,6 +892,14 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
     const weather        = await weatherRes.json();
     const currentUV      = +(uvRes?.current?.uv_index ?? 0).toFixed(0);
 
+    // ── Validate + smooth buoy reading ───────────────────────────────────────
+    // validateIsramarBuoy rejects physically impossible or stale readings.
+    // getSmoothedBuoyHeight applies an EMA (α=0.35) to prevent UI spikes.
+    const validBuoy       = isramarBuoy && validateIsramarBuoy(isramarBuoy) ? isramarBuoy : null;
+    const smoothedBuoyHs  = validBuoy ? await getSmoothedBuoyHeight(validBuoy.waveHeight) : null;
+    const buoyLive        = smoothedBuoyHs !== null;
+    const buoyFaceH       = smoothedBuoyHs !== null ? smoothedBuoyHs / 2 : undefined;
+
     // ── Current conditions ────────────────────────────────────────────────────
     // Prefer StormGlass (multi-model blend); fall back to Open-Meteo Marine current
 
@@ -549,29 +927,34 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
       // Approximate wind-wave component: sqrt(totalH² - swellH²)
       const windWaveH = Math.sqrt(Math.max(0, waveH * waveH - swellH * swellH));
       const waveP   = sgPeriod(sgNow, 'wavePeriod');
-      // Use buoy as ground truth for current wave height; otherwise use spectral formula
-      const currentFaceH = isramarBuoy
-        ? +(isramarBuoy.waveHeight / 2).toFixed(1)
-        : calcEffectiveWaveHeight(swellH, windWaveH, waveH);
+      // buoyFaceH = smoothed + validated EMA face height (or undefined → model only).
+      // Rough-sea blend (Hs ≥ 2 m): 80% buoy + 20% spectral via safeCalcWaveHeight.
+      const currentFaceH = safeCalcWaveHeight(swellH, windWaveH, waveH, buoyFaceH, beachId) ?? +(waveH / 2).toFixed(1);
+      // ── Beach calibration (final human-in-the-loop layer) ──
+      const calFaceH  = +(currentFaceH * calibration.height_factor).toFixed(1);
+      const calWind   = Math.max(0, Math.round(windKmh  + calibration.wind_bias_knots));
+      const calPeriod = +(waveP * calibration.period_factor).toFixed(1);
 
+      const sgWaveDeg = sgVal(sgNow, 'waveDirection');
       current = {
-        // ── CORRECTED ──
-        waveHeight:     currentFaceH,
-        windSpeed:      windKmh,
+        // ── CORRECTED + CALIBRATED ──
+        waveHeight:     calFaceH,
+        windSpeed:      calWind,
         // ── RAW — never modified ──
-        waveDirection:  degreesToCompass(sgVal(sgNow, 'waveDirection')),
-        waveDeg:        +sgVal(sgNow, 'waveDirection').toFixed(0),
-        wavePeriod:     isramarBuoy ? +isramarBuoy.wavePeriod.toFixed(1) : +sgPeriod(sgNow, 'wavePeriod').toFixed(1),
+        waveDirection:  degreesToCompass(sgWaveDeg),
+        waveDeg:        +sgWaveDeg.toFixed(0),
+        wavePeriod:     validBuoy ? +(validBuoy.wavePeriod * calibration.period_factor).toFixed(1) : calPeriod,
         swellHeight:    +sgVal(sgNow, 'swellHeight').toFixed(1),
-        swellDirection: degreesToCompass(sgVal(sgNow, 'swellDirection') || sgVal(sgNow, 'waveDirection')),
-        swellDeg:       +(sgVal(sgNow, 'swellDirection') || sgVal(sgNow, 'waveDirection')).toFixed(0),
+        swellDirection: degreesToCompass(sgVal(sgNow, 'swellDirection') || sgWaveDeg),
+        swellDeg:       +(sgVal(sgNow, 'swellDirection') || sgWaveDeg).toFixed(0),
         swellPeriod:    +sgPeriod(sgNow, 'swellPeriod').toFixed(1),
         windDirection:  degreesToCompass(sgVal(sgNow, 'windDirection')),
         windDeg:        +sgVal(sgNow, 'windDirection').toFixed(0),
         waterTemp:      +sgVal(sgNow, 'waterTemperature').toFixed(1),
         uvIndex:        Math.round(sgVal(sgNow, 'uvIndex')) || currentUV,
-        // ── DERIVED ──
-        rating:         calcRating(currentFaceH, waveP, windKmh, sgVal(sgNow, 'waveDirection'), sgWindDir),
+        // ── DERIVED (uses calibrated values + swell_angle_offset) ──
+        rating:         calcRating(calFaceH, calPeriod, calWind, sgWaveDeg, sgWindDir, calibration.swell_angle_offset),
+        waveEnergy:     safeCalcWaveEnergy(calFaceH, calPeriod, beachId) ?? 0,
       };
     } else {
       // Fallback: Open-Meteo Marine current
@@ -588,16 +971,19 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
       const windKts = adjustWind(wcur.wind_speed_10m ?? 0, fallbackWindDir);
       const fbSwellH    = cur.swell_wave_height ?? 0;
       const fbWindWaveH = Math.sqrt(Math.max(0, Math.pow(cur.wave_height ?? 0, 2) - Math.pow(fbSwellH, 2)));
-      const fbFaceH     = calcEffectiveWaveHeight(fbSwellH, fbWindWaveH, cur.wave_height ?? 0);
+      const fbFaceH     = safeCalcWaveHeight(fbSwellH, fbWindWaveH, cur.wave_height ?? 0, undefined, beachId) ?? +((cur.wave_height ?? 0) / 2).toFixed(1);
+      const fbCalFaceH  = +(fbFaceH * calibration.height_factor).toFixed(1);
+      const fbCalWind   = Math.max(0, Math.round(windKts + calibration.wind_bias_knots));
+      const fbCalPeriod = +((cur.wave_period ?? 0) * calibration.period_factor).toFixed(1);
 
       current = {
-        // ── CORRECTED ──
-        waveHeight:     fbFaceH,
-        windSpeed:      windKts,
+        // ── CORRECTED + CALIBRATED ──
+        waveHeight:     fbCalFaceH,
+        windSpeed:      fbCalWind,
         // ── RAW — never modified ──
         waveDirection:  degreesToCompass(cur.wave_direction ?? 0),
         waveDeg:        +(cur.wave_direction ?? 0),
-        wavePeriod:     +(cur.wave_period ?? 0).toFixed(1),
+        wavePeriod:     fbCalPeriod,
         swellHeight:    +(fbSwellH / 2).toFixed(1),
         swellDirection: degreesToCompass(cur.swell_wave_direction ?? 0),
         swellDeg:       +(cur.swell_wave_direction ?? 0),
@@ -606,8 +992,9 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
         windDeg:        fallbackWindDir,
         waterTemp:      +(cur.sea_surface_temperature ?? 0).toFixed(1),
         uvIndex:        currentUV,
-        // ── DERIVED ──
-        rating:         calcRating(fbFaceH, cur.wave_period ?? 0, windKts, cur.wave_direction ?? 270, fallbackWindDir),
+        // ── DERIVED (uses calibrated values + swell_angle_offset) ──
+        rating:         calcRating(fbCalFaceH, fbCalPeriod, fbCalWind, cur.wave_direction ?? 270, fallbackWindDir, calibration.swell_angle_offset),
+        waveEnergy:     safeCalcWaveEnergy(fbCalFaceH, fbCalPeriod, beachId) ?? 0,
       };
     }
 
@@ -638,24 +1025,33 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
 
     let waveHeightBiasOffset = await getRollingBias(currentWindDir);
 
-    if (isramarBuoy && nowHourIdx >= 0) {
+    if (validBuoy && nowHourIdx >= 0) {
       const modelHsNow = waveHeights[nowHourIdx] ?? 0;
       // Background EMA update for this wind sector (rate-limited, non-blocking)
-      updateRollingBias(isramarBuoy.waveHeight, modelHsNow, currentWindDir).catch(() => null);
+      updateRollingBias(validBuoy.waveHeight, modelHsNow, currentWindDir).catch(() => null);
       // Blend stored sector bias with live error for this request
-      const liveError = isramarBuoy.waveHeight - modelHsNow;
+      const liveError = validBuoy.waveHeight - modelHsNow;
       waveHeightBiasOffset = waveHeightBiasOffset * 0.7 + liveError * 0.3;
       waveHeightBiasOffset = Math.max(-0.8, Math.min(0.8, waveHeightBiasOffset));
     }
 
     const todayStr = _ilDate; // Israel local date — matches Open-Meteo and computeIsraelTides keys
+    const _tmrDate = new Date(_ilDate + 'T12:00:00Z');
+    _tmrDate.setUTCDate(_tmrDate.getUTCDate() + 1);
+    const tomorrowStr = _tmrDate.toISOString().split('T')[0];
+
+    // 8 canonical surf time-points: primary (today) + night bridge (tomorrow)
+    const SURF_PRIMARY  = [6, 9, 12, 15, 18, 21];
+    const SURF_NIGHT    = [0, 3];
+
     const todayHours: SurfHour[] = [];
 
     for (let i = 0; i < times.length; i++) {
       const [date, timeStr] = times[i].split('T');
-      if (date !== todayStr) continue;
       const hour = parseInt(timeStr);
-      if (hour < 6 || hour > 21 || hour % 3 !== 0) continue;
+      const isPrimary = date === todayStr    && SURF_PRIMARY.includes(hour);
+      const isNight   = date === tomorrowStr && SURF_NIGHT.includes(hour);
+      if (!isPrimary && !isNight) continue;
 
       // ── RAW fields — never modified by any correction ──
       const rawWavePeriod  = wavePeriods[i]  ?? 0;
@@ -664,21 +1060,26 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
       const rawWaveDir     = waveDirs[i]  ?? 270;
       const rawWindDir     = windDirs[i]  ?? 180;
 
-      // ── CORRECTED fields — only these two are processed ──
-      const corrWaveHeight = calcEffectiveWaveHeight(rawSwellHeight, windWaveHeights[i] ?? 0, (waveHeights[i] ?? 0) + waveHeightBiasOffset);
+      // ── CORRECTED → CALIBRATED ──
+      const rawTotalHs     = (waveHeights[i] ?? 0) + waveHeightBiasOffset;
+      const corrWaveHeight = safeCalcWaveHeight(rawSwellHeight, windWaveHeights[i] ?? 0, rawTotalHs, undefined, beachId) ?? +(rawTotalHs / 2).toFixed(1);
       const corrWindSpeed  = adjustWind(windSpeeds[i] ?? 0, rawWindDir);
+      const calWaveH  = +(corrWaveHeight * calibration.height_factor).toFixed(1);
+      const calWind   = Math.max(0, Math.round(corrWindSpeed + calibration.wind_bias_knots));
+      const calPeriod = +(rawWavePeriod  * calibration.period_factor).toFixed(1);
 
       todayHours.push({
         time:        timeStr.substring(0, 5),
-        waveHeight:  corrWaveHeight,
-        wavePeriod:  +rawWavePeriod.toFixed(1),
+        waveHeight:  calWaveH,
+        wavePeriod:  calPeriod,
         swellHeight: +(rawSwellHeight / 2).toFixed(1),
         swellDir:    degreesToCompass(rawSwellDir),
         swellDeg:    rawSwellDir,
-        windSpeed:   corrWindSpeed,
+        windSpeed:   calWind,
         windDir:     degreesToCompass(rawWindDir),
         windDeg:     rawWindDir,
-        rating:      calcRating(corrWaveHeight, rawWavePeriod, corrWindSpeed, rawWaveDir, rawWindDir),
+        rating:      calcRating(calWaveH, calPeriod, calWind, rawWaveDir, rawWindDir, calibration.swell_angle_offset),
+        waveEnergy:  safeCalcWaveEnergy(calWaveH, calPeriod, beachId) ?? 0,
       });
     }
 
@@ -697,7 +1098,7 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
       if (waveDirs[i]     != null) dayMap[date].wvd.push(waveDirs[i]);
 
       const hour = parseInt(timeStr);
-      if (hour >= 6 && hour <= 21 && hour % 3 === 0) {
+      if ([0, 3, 6, 9, 12, 15, 18, 21].includes(hour)) {
         // ── RAW fields — never modified by any correction ──
         const rawWavePeriod  = wavePeriods[i]  ?? 0;
         const rawSwellHeight = swellHeights[i] ?? 0;
@@ -705,21 +1106,26 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
         const rawWaveDir     = waveDirs[i]  ?? 270;
         const rawWindDir     = windDirs[i]  ?? 180;
 
-        // ── CORRECTED fields — only these two are processed ──
-        const corrWaveHeight = calcEffectiveWaveHeight(rawSwellHeight, windWaveHeights[i] ?? 0, (waveHeights[i] ?? 0) + waveHeightBiasOffset);
+        // ── CORRECTED → CALIBRATED ──
+        const dRawTotalHs    = (waveHeights[i] ?? 0) + waveHeightBiasOffset;
+        const corrWaveHeight = safeCalcWaveHeight(rawSwellHeight, windWaveHeights[i] ?? 0, dRawTotalHs, undefined, beachId) ?? +(dRawTotalHs / 2).toFixed(1);
         const corrWindSpeed  = adjustWind(windSpeeds[i] ?? 0, rawWindDir);
+        const dCalWaveH  = +(corrWaveHeight * calibration.height_factor).toFixed(1);
+        const dCalWind   = Math.max(0, Math.round(corrWindSpeed + calibration.wind_bias_knots));
+        const dCalPeriod = +(rawWavePeriod  * calibration.period_factor).toFixed(1);
 
         dayMap[date].hours.push({
           time:        timeStr.substring(0, 5),
-          waveHeight:  corrWaveHeight,
-          wavePeriod:  +rawWavePeriod.toFixed(1),
+          waveHeight:  dCalWaveH,
+          wavePeriod:  dCalPeriod,
           swellHeight: +(rawSwellHeight / 2).toFixed(1),
           swellDir:    degreesToCompass(rawSwellDir),
           swellDeg:    rawSwellDir,
-          windSpeed:   corrWindSpeed,
+          windSpeed:   dCalWind,
           windDir:     degreesToCompass(rawWindDir),
           windDeg:     rawWindDir,
-          rating:      calcRating(corrWaveHeight, rawWavePeriod, corrWindSpeed, rawWaveDir, rawWindDir),
+          rating:      calcRating(dCalWaveH, dCalPeriod, dCalWind, rawWaveDir, rawWindDir, calibration.swell_angle_offset),
+          waveEnergy:  safeCalcWaveEnergy(dCalWaveH, dCalPeriod, beachId) ?? 0,
         });
       }
     }
@@ -729,10 +1135,10 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
 
     const days: SurfDay[] = Object.entries(dayMap).slice(0, 7).map(([date, d]) => {
       const avgWindDir = avg(d.wd);
-      const waveMin = d.wh.length ? (Math.min(...d.wh) + waveHeightBiasOffset) / 2 : 0;
-      const waveMax = d.wh.length ? (Math.max(...d.wh) + waveHeightBiasOffset) / 2 : 0;
-      const period  = avg(d.wp);
-      const wind    = adjustWind(avg(d.ws), avgWindDir);
+      const waveMin = d.wh.length ? ((Math.min(...d.wh) + waveHeightBiasOffset) / 2) * calibration.height_factor : 0;
+      const waveMax = d.wh.length ? ((Math.max(...d.wh) + waveHeightBiasOffset) / 2) * calibration.height_factor : 0;
+      const period  = avg(d.wp) * calibration.period_factor;
+      const wind    = Math.max(0, adjustWind(avg(d.ws), avgWindDir) + calibration.wind_bias_knots);
       const windDeg = avgWindDir;
       const waveDirAvg = avg(d.wvd);
       const d0    = new Date(date + 'T00:00:00');
@@ -740,6 +1146,15 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
       const label   = date === today
         ? `היום ${dateStr}`
         : `יום ${HEBREW_DAYS[d0.getDay()]} ${dateStr}`;
+
+      // Build 8-point hours: primary [6,9,12,15,18,21] from this date
+      // + night bridge [0,3] from the next calendar date
+      const _nd = new Date(date + 'T12:00:00Z');
+      _nd.setUTCDate(_nd.getUTCDate() + 1);
+      const nextDateStr = _nd.toISOString().split('T')[0];
+      const primaryHours = d.hours.filter(h => [6, 9, 12, 15, 18, 21].includes(parseInt(h.time)));
+      const nightHours   = (dayMap[nextDateStr]?.hours ?? []).filter(h => [0, 3].includes(parseInt(h.time)));
+
       return {
         date, label,
         waveMin: +waveMin.toFixed(1),
@@ -749,7 +1164,7 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
         windDir: degreesToCompass(windDeg),
         windDeg: +windDeg.toFixed(0),
         rating:  calcRating(waveMax, period, wind, waveDirAvg, windDeg),
-        hours: d.hours,
+        hours: [...primaryHours, ...nightHours],
         tides: tidesMap?.heights.get(date) ?? [],
         tideExtremes: tidesMap?.extremes.get(date) ?? [],
       };
@@ -772,12 +1187,24 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
     const sunset  = fmtSun(sunsetRaw);
 
     const sources = [
-      isramarBuoy ? 'ISRAMAR Hadera Buoy (measured)' : 'StormGlass (ECMWF+NOAA+DWD)',
+      buoyLive ? 'ISRAMAR Hadera Buoy (measured)' : 'StormGlass (ECMWF+NOAA+DWD)',
       'StormGlass (wind/direction)',
       'Open-Meteo Marine',
       'ECMWF IFS Wind',
       usingWorldTides ? 'WorldTides API (authoritative)' : 'Harmonic Tide Model (FES2014/TPXO — fallback)',
     ];
+
+    const isCalibrated =
+      calibration.height_factor      !== 1.0 ||
+      calibration.period_factor      !== 1.0 ||
+      calibration.wind_bias_knots    !== 0   ||
+      calibration.swell_angle_offset !== 0;
+
+    const confidenceScore =
+      30                          // baseline: Open-Meteo always available
+      + (buoyLive        ? 35 : 0)  // measured wave data from ISRAMAR
+      + (usingWorldTides ? 25 : 0)  // authoritative tides (vs harmonic fallback)
+      + (isCalibrated    ? 10 : 0); // beach has been tuned by an operator
 
     return {
       current,
@@ -786,6 +1213,9 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
       tides: tidesMap?.heights.get(todayStr) ?? [],
       tideExtremes: tidesMap?.extremes.get(todayStr) ?? [],
       sources,
+      buoyLive,
+      calibration,
+      confidenceScore,
       fetchedAt: new Date().toISOString(),
       sunrise,
       sunset,
