@@ -2,8 +2,9 @@
 
 import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
-import type { SurfForecastData, TidePoint, TideExtreme } from '@/lib/api/surf';
+import type { SurfForecastData } from '@/lib/api/surf';
 import { BeachSelector } from './BeachSelector';
+import { TideChart } from './TideChart';
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 const DARK_THEME = {
@@ -280,83 +281,6 @@ function StatCard({ label, value, sub, deg, arrowColor, onClick, extra, t }: {
   );
 }
 
-function TideDiagram({ tides, exactExtremes = [], t }: { tides: TidePoint[]; exactExtremes?: TideExtreme[]; t: Theme }) {
-  const [nowHour, setNowHour] = React.useState<number | null>(null);
-  React.useEffect(() => {
-    setNowHour(new Date().getHours() + new Date().getMinutes() / 60);
-  }, []);
-
-  const W = 360, H = 195, PAD = { top: 28, bottom: 66, left: 12, right: 12 };
-  const innerW = W - PAD.left - PAD.right;
-  const innerH = H - PAD.top - PAD.bottom;
-  const heights = tides.map(t2 => t2.height);
-  const minH = Math.min(...heights), maxH = Math.max(...heights);
-  const range = maxH - minH || 0.01;
-  const toX = (h: number) => PAD.left + (h / 24) * innerW;
-  const toY = (v: number) => PAD.top + innerH - ((v - minH) / range) * innerH;
-
-  const pts = tides.map(t2 => ({ x: toX(t2.hour), y: toY(t2.height) }));
-  let d = `M ${pts[0].x} ${pts[0].y}`;
-  for (let i = 1; i < pts.length; i++) {
-    const p0 = pts[Math.max(0, i - 2)], p1 = pts[i - 1], p2 = pts[i], p3 = pts[Math.min(pts.length - 1, i + 1)];
-    d += ` C ${p1.x + (p2.x - p0.x) / 6} ${p1.y + (p2.y - p0.y) / 6}, ${p2.x - (p3.x - p1.x) / 6} ${p2.y - (p3.y - p1.y) / 6}, ${p2.x} ${p2.y}`;
-  }
-
-  const extremes = exactExtremes.length > 0
-    ? exactExtremes.map(e => ({ hour: e.hour, height: e.height, type: e.type === 'High' ? 'high' : 'low' as 'high' | 'low', timeStr: e.timeStr }))
-    : (() => {
-        const found: { hour: number; height: number; type: 'high' | 'low'; timeStr: string }[] = [];
-        for (let i = 1; i < tides.length - 1; i++) {
-          const prev = tides[i-1].height, cur = tides[i].height, next = tides[i+1].height;
-          const hh = Math.floor(tides[i].hour), mm = Math.round((tides[i].hour - hh) * 60);
-          const timeStr = `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
-          if (cur > prev && cur > next) found.push({ ...tides[i], type: 'high', timeStr });
-          if (cur < prev && cur < next) found.push({ ...tides[i], type: 'low', timeStr });
-        }
-        return found;
-      })();
-
-  const nowX = nowHour !== null ? toX(nowHour) : null;
-  const hourLabels = [0, 6, 12, 18, 24];
-
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ overflow: 'visible' }}>
-      {hourLabels.map(h => (
-        <line key={h} x1={toX(h)} y1={PAD.top} x2={toX(h)} y2={PAD.top + innerH} stroke={t.tideGrid} strokeWidth={1} />
-      ))}
-      <line x1={PAD.left} y1={toY(0)} x2={PAD.left + innerW} y2={toY(0)} stroke={t.tideSea} strokeWidth={1.5} strokeDasharray="5 4" />
-      <defs>
-        <linearGradient id="tideGrad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.45" />
-          <stop offset="100%" stopColor="#38bdf8" stopOpacity="0.04" />
-        </linearGradient>
-      </defs>
-      <path d={`${d} L ${pts[pts.length-1].x} ${PAD.top + innerH} L ${pts[0].x} ${PAD.top + innerH} Z`} fill="url(#tideGrad)" />
-      <path d={d} fill="none" stroke="#38bdf8" strokeWidth={3.5} strokeLinejoin="round" strokeLinecap="round" />
-      {extremes.map((e, i) => {
-        const isHigh = e.type === 'high';
-        const labelY = isHigh ? toY(e.height) - 10 : toY(e.height) + 20;
-        return (
-          <g key={i}>
-            <circle cx={toX(e.hour)} cy={toY(e.height)} r={5} fill={isHigh ? '#38bdf8' : '#475569'} />
-            <text x={toX(e.hour)} y={labelY} textAnchor="middle" fontSize={13} fontWeight="700" fill={isHigh ? '#38bdf8' : t.txt3}>
-              {isHigh ? 'גאות' : 'שפל'} {e.timeStr}
-            </text>
-          </g>
-        );
-      })}
-      {nowX !== null && nowHour! <= 24 && (
-        <line x1={nowX} y1={PAD.top} x2={nowX} y2={PAD.top + innerH} stroke="#ef4444" strokeWidth={2} strokeDasharray="4 3" />
-      )}
-      {hourLabels.map(h => (
-        <text key={h} x={toX(h)} y={H - 8} textAnchor="middle" fontSize={15} fontWeight="700" fill={t.tideLabel}>
-          {h === 24 ? '00' : String(h).padStart(2, '0')}:00
-        </text>
-      ))}
-    </svg>
-  );
-}
-
 // ── Main component ─────────────────────────────────────────────────────────────
 export function SurfForecast({ data, beachName, selectedBeachId, hasExplicitCity }: {
   data: SurfForecastData; beachName?: string; selectedBeachId?: string; hasExplicitCity?: boolean
@@ -484,9 +408,7 @@ export function SurfForecast({ data, beachName, selectedBeachId, hasExplicitCity
           <div style={{ backgroundColor: t.headBg }} className="p-4 mt-auto">
             <div className="hidden lg:block">
               <div className="text-sm font-bold uppercase tracking-widest mb-2" style={{ color: t.sectionTxt }}>גאות ושפל – היום</div>
-              <div style={{ maxWidth: 420, margin: '0 auto' }}>
-                <TideDiagram tides={data.tides} exactExtremes={data.tideExtremes} t={t} />
-              </div>
+              <TideChart tides={data.tides} exactExtremes={data.tideExtremes} isDark={isDark} />
             </div>
             <div className="lg:hidden">
               <button onClick={() => setShowTides(v => !v)} className="w-full py-2 text-sm font-bold rounded"
@@ -494,8 +416,8 @@ export function SurfForecast({ data, beachName, selectedBeachId, hasExplicitCity
                 {showTides ? 'הסתר נתוני גאות ושפל' : 'נתוני גאות ושפל'}
               </button>
               {showTides && (
-                <div style={{ borderRadius: 6 }} className="p-4">
-                  <TideDiagram tides={data.tides} exactExtremes={data.tideExtremes} t={t} />
+                <div className="pt-3">
+                  <TideChart tides={data.tides} exactExtremes={data.tideExtremes} isDark={isDark} />
                 </div>
               )}
             </div>
@@ -622,11 +544,9 @@ export function SurfForecast({ data, beachName, selectedBeachId, hasExplicitCity
                       {showDayTides === day.date ? 'הסתר נתוני גאות ושפל' : 'נתוני גאות ושפל'}
                     </button>
                     {showDayTides === day.date && (
-                      <div style={{ backgroundColor: t.bgRow, borderRadius: 6, border: `1px solid ${t.border}` }} className="p-4">
-                        <div className="text-xs font-bold mb-3" style={{ color: t.blue }}>גאות ושפל – {day.label}</div>
-                        <div style={{ maxWidth: 420, margin: '0 auto' }}>
-                          <TideDiagram tides={day.tides} exactExtremes={day.tideExtremes} t={t} />
-                        </div>
+                      <div className="pt-2">
+                        <div className="text-xs font-bold mb-2" style={{ color: t.blue }}>גאות ושפל – {day.label}</div>
+                        <TideChart tides={day.tides} exactExtremes={day.tideExtremes} isDark={isDark} />
                       </div>
                     )}
                   </div>

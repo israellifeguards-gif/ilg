@@ -1040,6 +1040,87 @@ export async function fetchSurfForecast(lat = DEFAULT_LAT, lng = DEFAULT_LNG, be
     _tmrDate.setUTCDate(_tmrDate.getUTCDate() + 1);
     const tomorrowStr = _tmrDate.toISOString().split('T')[0];
 
+    // ── Apply admin tide-event overrides (saved by BeachCalibrationPanel) ─────
+    // beach_hourly_overrides/{beachId}_{date}._tides overrides tidesMap.extremes
+    // for today, so the public surf page shows the admin-corrected times/types.
+    if (beachId && tidesMap) {
+      try {
+        const ovSnap = await getDoc(doc(db, 'beach_hourly_overrides', `${beachId}_${todayStr}`));
+        if (ovSnap.exists()) {
+          const raw       = ovSnap.data() as Record<string, unknown>;
+          const adminTides = raw._tides as { time: string; type: 'High' | 'Low' }[] | undefined;
+          if (adminTides && adminTides.length > 0) {
+            const hourlyPts   = tidesMap.heights.get(todayStr) ?? [];
+            const modelExtremes = tidesMap.extremes.get(todayStr) ?? [];
+
+            // ── 1. Compute average time offset (admin vs model, same type) ──────
+            const offsets: number[] = [];
+            for (const ev of adminTides) {
+              const [hh, mm] = ev.time.split(':').map(Number);
+              const adminHour = hh + mm / 60;
+              // Find nearest model extreme of the same type
+              const sameType = modelExtremes.filter(m => m.type === ev.type);
+              if (!sameType.length) continue;
+              const nearest = sameType.reduce((a, b) =>
+                Math.abs(b.hour - adminHour) < Math.abs(a.hour - adminHour) ? b : a
+              );
+              offsets.push(adminHour - nearest.hour);
+            }
+            const avgOffset = offsets.length ? offsets.reduce((a, b) => a + b, 0) / offsets.length : 0;
+
+            // ── 2. Shift the tide curve by avgOffset (with clamping) ─────────────
+            // For each output hour H, sample the original curve at H - avgOffset,
+            // clamped to the available range to avoid edge discontinuities.
+            let shiftedPts = hourlyPts;
+            if (Math.abs(avgOffset) > 0.05 && hourlyPts.length >= 2) {
+              const minH = hourlyPts[0].hour;
+              const maxH = hourlyPts[hourlyPts.length - 1].hour;
+
+              const lerp = (srcH: number): number => {
+                const clamped = Math.max(minH, Math.min(maxH, srcH));
+                let lo = hourlyPts[0], hi = hourlyPts[hourlyPts.length - 1];
+                for (let j = 0; j < hourlyPts.length - 1; j++) {
+                  if (hourlyPts[j].hour <= clamped && hourlyPts[j + 1].hour >= clamped) {
+                    lo = hourlyPts[j]; hi = hourlyPts[j + 1]; break;
+                  }
+                }
+                if (lo.hour === hi.hour) return lo.height;
+                const t = (clamped - lo.hour) / (hi.hour - lo.hour);
+                return +(lo.height + t * (hi.height - lo.height)).toFixed(3);
+              };
+
+              shiftedPts = hourlyPts.map(p => ({ hour: p.hour, height: lerp(p.hour - avgOffset) }));
+            }
+
+            // ── 3. Snap dots to peaks/valleys of the SHIFTED curve ───────────────
+            const finalExtremes: TideExtreme[] = adminTides.map(ev => {
+              const [hh, mm] = ev.time.split(':').map(Number);
+              const adminHour = hh + mm / 60;
+
+              if (!shiftedPts.length) {
+                return { hour: adminHour, height: 0, type: ev.type, timeStr: ev.time };
+              }
+
+              const window = shiftedPts.filter(p => Math.abs(p.hour - adminHour) <= 3);
+              const pool   = window.length >= 2 ? window : shiftedPts;
+
+              const best = ev.type === 'High'
+                ? pool.reduce((p, c) => c.height > p.height ? c : p)
+                : pool.reduce((p, c) => c.height < p.height ? c : p);
+
+              return { hour: best.hour, height: best.height, type: ev.type, timeStr: ev.time };
+            });
+
+            const newHeights = new Map(tidesMap.heights);
+            newHeights.set(todayStr, shiftedPts);
+            const newExtremes = new Map(tidesMap.extremes);
+            newExtremes.set(todayStr, finalExtremes);
+            tidesMap = { ...tidesMap, heights: newHeights, extremes: newExtremes };
+          }
+        }
+      } catch { /* silently ignore — fall back to model extremes */ }
+    }
+
     // 8 canonical surf time-points: primary (today) + night bridge (tomorrow)
     const SURF_PRIMARY  = [6, 9, 12, 15, 18, 21];
     const SURF_NIGHT    = [0, 3];
