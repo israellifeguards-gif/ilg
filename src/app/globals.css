@@ -27,6 +27,7 @@ body {
   color: var(--foreground);
   font-family: 'Heebo', sans-serif;
   min-height: 100vh;
+  overflow-x: hidden;
 }
 
 /* Scrollbar */

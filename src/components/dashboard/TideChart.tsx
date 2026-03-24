@@ -80,7 +80,10 @@ function completeTidalCycle(userExtremes: TideLabel[]): TideLabel[] {
   const highs = sorted.filter(e => e.type === 'high');
   const lows  = sorted.filter(e => e.type === 'low');
   const avgHi = highs.length ? highs.reduce((s, e) => s + e.height, 0) / highs.length : 1.5;
-  const avgLo = lows.length  ? lows.reduce((s,  e) => s + e.height, 0) / lows.length  : 0.3;
+  const rawLo = lows.length  ? lows.reduce((s,  e) => s + e.height, 0) / lows.length  : 0.3;
+  // Ensure predicted Low height is always strictly below avgHi — prevents inversion
+  // when Med. harmonic heights (~±0.2 m) cause the 0.3 default to exceed actual Highs.
+  const avgLo = Math.min(rawLo, avgHi - 0.05);
 
   const fmtH = (h: number): string => {
     const norm = ((h % 24) + 24) % 24;
@@ -140,8 +143,8 @@ export function TideChart({
   const H  = 200;
   //  left/right pad wide enough that "00:00" (≈33 px at 11 px font, centered)
   //  stays fully inside the viewBox on both sides.
-  const PAD = { top: 44, bottom: 48, left: 28, right: 28 };
-  const innerW = W - PAD.left - PAD.right;   // 304
+  const PAD = { top: 44, bottom: 48, left: 36, right: 36 };
+  const innerW = W - PAD.left - PAD.right;   // 288
   const innerH = H - PAD.top  - PAD.bottom;  // 108
 
   // ── Build normalised extreme list ──────────────────────────────────────────
@@ -162,7 +165,12 @@ export function TideChart({
       ? completeTidalCycle(userExtremes)
       : [];
 
-  const labelExtremes: TideLabel[] = allExtremes.filter(e => e.hour >= 0 && e.hour <= 24);
+  // Exactly 2 High + 2 Low within the day, sorted chronologically
+  const _within = allExtremes.filter(e => e.hour >= 0 && e.hour <= 24);
+  const labelExtremes: TideLabel[] = [
+    ..._within.filter(e => e.type === 'high').slice(0, 2),
+    ..._within.filter(e => e.type === 'low').slice(0, 2),
+  ].sort((a, b) => a.hour - b.hour);
 
   // ── Dense sinusoidal curve — always use cosine engine ─────────────────────
   // 481 points (every 3 min) → ~0.63 px/step at innerW=304, visually perfect.
@@ -181,25 +189,36 @@ export function TideChart({
   const domRange = domMax - domMin;
 
   const toX = (h: number) => PAD.left + (h / 24) * innerW;
-  const toY = (v: number) => PAD.top + innerH - ((v - domMin) / domRange) * innerH;
+  // High tide (large v) → small SVG y (top). Low tide (small v) → large SVG y (bottom).
+  const toY = (v: number) => PAD.top + (1 - (v - domMin) / domRange) * innerH;
 
   // ── Smooth cubic-bezier path ───────────────────────────────────────────────
   // Each cosine segment has zero derivative at both endpoints (extremes), so the
-  // perfect cubic-bezier approximation uses horizontal control points at ±1/3 dx.
-  // For the edges (before first extreme, after last extreme) we use the dense
-  // L-command polyline from buildSineCurve, which is sub-pixel smooth.
-  //
-  // Practical approach: generate the SVG path as one M + a series of C commands,
-  // one per consecutive extreme pair, clipped to [0, 24].
+  // cubic-bezier with horizontal control points at ±1/3 dx nails the curve exactly.
+  // allExtremes extends beyond [0,24] so the bezier fills the full chart area;
+  // both stroke and fill are clipped to the inner chart rect via clipPath.
   let pathD = '';
   let fillD = '';
 
-  if (curvePts.length >= 2) {
-    // Dense polyline path (smooth at this resolution)
-    pathD = curvePts
-      .map((p, i) => `${i === 0 ? 'M' : 'L'}${toX(p.hour).toFixed(1)},${toY(p.height).toFixed(1)}`)
-      .join(' ');
-    fillD = `${pathD} L${toX(24).toFixed(1)},${(PAD.top + innerH).toFixed(1)} L${toX(0).toFixed(1)},${(PAD.top + innerH).toFixed(1)}Z`;
+  if (allExtremes.length >= 2) {
+    const sortedEx = [...allExtremes].sort((a, b) => a.hour - b.hour);
+    const exPts = sortedEx.map(e => ({ x: toX(e.hour), y: toY(e.height) }));
+
+    const cmds: string[] = [`M${exPts[0].x.toFixed(1)},${exPts[0].y.toFixed(1)}`];
+    for (let i = 0; i < exPts.length - 1; i++) {
+      const p0 = exPts[i];
+      const p3 = exPts[i + 1];
+      const dx = (p3.x - p0.x) / 3;
+      cmds.push(
+        `C${(p0.x + dx).toFixed(1)},${p0.y.toFixed(1)} ` +
+        `${(p3.x - dx).toFixed(1)},${p3.y.toFixed(1)} ` +
+        `${p3.x.toFixed(1)},${p3.y.toFixed(1)}`
+      );
+    }
+
+    pathD = cmds.join(' ');
+    const baseY = (PAD.top + innerH).toFixed(1);
+    fillD = `${pathD} L${exPts[exPts.length - 1].x.toFixed(1)},${baseY} L${exPts[0].x.toFixed(1)},${baseY}Z`;
   }
 
   // ── Now marker ─────────────────────────────────────────────────────────────
@@ -231,7 +250,7 @@ export function TideChart({
         {/* Gradient fill — clipped to chart area */}
         {fillD && <path d={fillD} fill={`url(#${gradId})`} clipPath={`url(#${clipId})`} />}
 
-        {/* Smooth curve — 481 dense L-commands, sub-pixel at all mobile widths */}
+        {/* Smooth cubic-bezier curve — clipped to chart area */}
         {pathD && (
           <path
             d={pathD}
@@ -240,8 +259,16 @@ export function TideChart({
             strokeWidth={2.8}
             strokeLinejoin="round"
             strokeLinecap="round"
+            clipPath={`url(#${clipId})`}
           />
         )}
+
+        {/* Baseline — sits below chart data, above hour labels */}
+        <line
+          x1={PAD.left} y1={H - 20}
+          x2={PAD.left + innerW} y2={H - 20}
+          stroke={colors.base} strokeWidth={1}
+        />
 
         {/* Extreme dots + labels ───────────────────────────────────────────── */}
         {labelExtremes.map((e, i) => {
@@ -249,12 +276,10 @@ export function TideChart({
           const cx = toX(e.hour);
           const cy = toY(e.height);
 
-          // Breathing room targets (dot radius = 5):
-          //   HIGH → label baseline 22 px above cy:
-          //          visual label-bottom ≈ cy−19, dot-top = cy−5, gap ≈ 14 px ✓
-          //   LOW  → label baseline 26 px below cy:
-          //          visual label-top    ≈ cy+17, dot-bottom = cy+5, gap ≈ 12 px ✓
-          const rawLY  = isHigh ? cy - 22 : cy + 26;
+          // Labels sit 22 px from the dot center:
+          //   HIGH (at top) → label 22 px above the peak dot
+          //   LOW (at bottom) → label 22 px below the trough dot
+          const rawLY  = isHigh ? cy - 22 : cy + 22;
           const labelY = Math.max(14, Math.min(H - 14, rawLY));
 
           const labelColor = isHigh ? colors.hi : colors.lo;
@@ -311,9 +336,9 @@ export function TideChart({
 
         {/* X-axis time labels ─────────────────────────────────────────────── */}
         {/*  All five labels use textAnchor="middle" so they center on their   */}
-        {/*  tick.  PAD.left=28 & PAD.right=28 keep toX(0)=28 and toX(24)=332, */}
-        {/*  so "00:00" (≈33 px wide) extends to x≈11.5 and x≈348.5 — both    */}
-        {/*  well inside the 0–360 viewBox.                                    */}
+        {/*  tick.  PAD.left=36 & PAD.right=36 keep toX(0)=36 and toX(24)=324, */}
+        {/*  so "00:00" (≈33 px wide) extends to x≈19 and x≈341 — both        */}
+        {/*  comfortably inside the 0–360 viewBox.                             */}
         {hourLabels.map(h => (
           <text
             key={h}
@@ -329,12 +354,6 @@ export function TideChart({
           </text>
         ))}
 
-        {/* Baseline */}
-        <line
-          x1={PAD.left} y1={PAD.top + innerH}
-          x2={PAD.left + innerW} y2={PAD.top + innerH}
-          stroke={colors.base} strokeWidth={1}
-        />
       </svg>
     </div>
   );

@@ -1,7 +1,9 @@
 import { NextResponse } from 'next/server';
 import { BEACHES } from '@/lib/beaches';
-import { fetchBeachCalibration } from '@/lib/api/beachCalibration';
+import { fetchCalibrationDoc } from '@/lib/api/beachCalibration';
 import { writeModelBatch } from '@/lib/api/beachTimeSeries';
+import { fetchTideEventOverrides } from '@/lib/api/beachHourlyCal';
+import type { TideEventOverride } from '@/lib/api/beachHourlyCal';
 
 export const dynamic = 'force-dynamic';
 
@@ -15,6 +17,34 @@ function calcEnergy(hs: number, t: number): number {
 function adjustWind(kts: number, dir = 180): number {
   if (!isFinite(kts) || kts < 0) return 0;
   return Math.round(kts * (dir >= 90 && dir <= 130 ? 1.1 : 1.5));
+}
+
+// ── Tide-aware correction ─────────────────────────────────────────────────────
+// Interpolates tidal phase from manual override events and applies ±4%
+// wave-height adjustment (High tide = +4%, Low tide = -4%).
+
+function tideMultiplier(overrides: TideEventOverride[], hour: number): number {
+  if (!overrides.length) return 1;
+  const pts = overrides
+    .map(e => {
+      const [hh, mm] = e.time.split(':').map(Number);
+      return { h: hh + mm / 60, isHigh: e.type === 'High' };
+    })
+    .sort((a, b) => a.h - b.h);
+
+  const before = [...pts].reverse().find(p => p.h <= hour);
+  const after  = pts.find(p => p.h > hour);
+
+  let phase: number; // 0 = Low, 1 = High
+  if (!before && !after) return 1;
+  if (!before) phase = after!.isHigh ? 0.1 : 0.9;
+  else if (!after) phase = before.isHigh ? 0.9 : 0.1;
+  else {
+    const t = (hour - before.h) / (after.h - before.h);
+    phase   = before.isHigh ? 1 - t : t;
+  }
+  // ±4% correction centred on mid-tide (phase = 0.5)
+  return 1 + (phase - 0.5) * 0.08;
 }
 
 // ── Route ─────────────────────────────────────────────────────────────────────
@@ -38,7 +68,7 @@ export async function POST(req: Request) {
   const date = searchParams.get('date') ?? `${g('year')}-${g('month')}-${g('day')}`;
 
   try {
-    const [marineRes, weatherRes, calibration] = await Promise.all([
+    const [marineRes, weatherRes, calDoc, tideOverrides] = await Promise.all([
       fetch(
         `https://marine-api.open-meteo.com/v1/marine` +
         `?latitude=${beach.lat}&longitude=${beach.lng}` +
@@ -53,11 +83,18 @@ export async function POST(req: Request) {
         `&models=ecmwf_ifs025&wind_speed_unit=kn&forecast_days=7&timezone=Asia%2FJerusalem`,
         { cache: 'no-store' },
       ),
-      fetchBeachCalibration(beachId),
+      fetchCalibrationDoc(beachId),
+      fetchTideEventOverrides(beachId, date).catch(() => [] as TideEventOverride[]),
     ]);
 
     const marine  = await marineRes.json();
     const weather = await weatherRes.json();
+
+    // Learned ratios take priority over static calibration factors for forward-looking sync
+    const hsFactor     = calDoc.current_beach_bias ?? calDoc.height_factor ?? 1.0;
+    const periodFactor = calDoc.current_t_ratio    ?? calDoc.period_factor ?? 1.0;
+    const windRatio    = calDoc.current_wind_ratio ?? 1.0;
+    const windBias     = calDoc.wind_bias_knots    ?? 0;
 
     const times:       string[] = marine.hourly?.time               ?? [];
     const waveHeights: number[] = marine.hourly?.wave_height        ?? [];
@@ -77,9 +114,11 @@ export async function POST(req: Request) {
       const rawWindDir = windDirs[i] ?? 180;
       const rawWind    = adjustWind(windSpeeds[i] ?? 0, rawWindDir);
 
-      const calHs   = +(rawHs * calibration.height_factor).toFixed(2);
-      const calT    = +(rawT  * calibration.period_factor).toFixed(1);
-      const calWind = Math.max(0, Math.round(rawWind + calibration.wind_bias_knots));
+      // Apply bias × tide-aware correction to wave height
+      const tideMult = tideMultiplier(tideOverrides, hour);
+      const calHs    = +(rawHs * hsFactor * tideMult).toFixed(2);
+      const calT     = +(rawT  * periodFactor).toFixed(1);
+      const calWind  = Math.max(0, Math.round(rawWind * windRatio + windBias));
 
       entries.push({
         hour,

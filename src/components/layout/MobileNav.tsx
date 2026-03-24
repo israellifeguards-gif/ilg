@@ -92,7 +92,7 @@ export function MobileNav() {
         href="/updates"
         onClick={() => setHasNewUpdate(false)}
         className="md:hidden fixed z-50"
-        style={{ bottom: '88px', right: '20px' }}
+        style={{ bottom: 'calc(env(safe-area-inset-bottom, 0px) + 100px)', right: '20px' }}
       >
         <div
           className="relative flex items-center justify-center rounded-full shadow-2xl transition-transform active:scale-90"
@@ -125,7 +125,7 @@ export function MobileNav() {
       </Link>
 
       {/* Bottom nav */}
-      <nav className="md:hidden fixed bottom-6 left-4 right-4 bg-black border border-gray-800 z-40 rounded-2xl">
+      <nav className="md:hidden fixed left-4 right-4 bg-black border border-gray-800 z-40 rounded-2xl" style={{ bottom: 'calc(env(safe-area-inset-bottom, 0px) + 24px)' }}>
         <div className="flex items-center justify-around px-2 py-2">
           {navItems.map((item) => {
             if (item.isLogin) {

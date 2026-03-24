@@ -27,6 +27,13 @@ export interface BeachCalibration {
   period_factor:      number;
   wind_bias_knots:    number;
   swell_angle_offset: number;
+  current_beach_bias?: number;  // Hs ratio from last TLV override (override / raw)
+  current_t_ratio?:   number;   // Period ratio from last TLV override
+  current_wind_ratio?: number;  // Wind speed ratio from last TLV override
+  // Custom DNA — set via Beach Calibration Tool in admin panel
+  proxy_hs_multiplier?:   number;  // overrides BEACH_PROXY_CONFIG.hsMultiplier
+  proxy_wind_multiplier?: number;  // overrides BEACH_PROXY_CONFIG.windMultiplier
+  proxy_wind_dir_offset?: number;  // overrides BEACH_PROXY_CONFIG.windDirOffset
 }
 
 export interface CalibrationDoc extends BeachCalibration {
@@ -97,10 +104,16 @@ export async function fetchBeachCalibration(beachId: string): Promise<BeachCalib
     if (!snap.exists()) return { ...CAL_DEFAULTS };
     const d = snap.data() as Partial<CalibrationDoc>;
     return {
-      height_factor:      clamp(d.height_factor      ?? 1.0, ...H_CLAMP),
-      period_factor:      clamp(d.period_factor      ?? 1.0, ...P_CLAMP),
-      wind_bias_knots:    clamp(d.wind_bias_knots    ?? 0,   ...W_CLAMP),
-      swell_angle_offset: clamp(d.swell_angle_offset ?? 0,   ...A_CLAMP),
+      height_factor:        clamp(d.height_factor      ?? 1.0, ...H_CLAMP),
+      period_factor:        clamp(d.period_factor      ?? 1.0, ...P_CLAMP),
+      wind_bias_knots:      clamp(d.wind_bias_knots    ?? 0,   ...W_CLAMP),
+      swell_angle_offset:   clamp(d.swell_angle_offset ?? 0,   ...A_CLAMP),
+      current_beach_bias:   d.current_beach_bias,
+      current_t_ratio:      d.current_t_ratio,
+      current_wind_ratio:   d.current_wind_ratio,
+      proxy_hs_multiplier:  d.proxy_hs_multiplier,
+      proxy_wind_multiplier: d.proxy_wind_multiplier,
+      proxy_wind_dir_offset: d.proxy_wind_dir_offset,
     };
   } catch {
     return { ...CAL_DEFAULTS };
@@ -235,4 +248,43 @@ export async function submitBeachObservation(
     timestamp:        new Date().toISOString(),
   }));
   return { oldFactor: +oldFactor.toFixed(4), newFactor: +newFactor.toFixed(4), ratio: +ratio.toFixed(3), observationCount: count };
+}
+
+// ── setBeachBias ──────────────────────────────────────────────────────────────
+// Persists the correction ratios (override / raw) computed from a TLV manual override.
+// These are used by the sync pipeline as forward-looking calibration signals.
+
+// ── setBeachProxyConfig ────────────────────────────────────────────────────────
+// Saves custom DNA multipliers for a beach set via the Beach Calibration Tool.
+// These override the hardcoded BEACH_PROXY_CONFIG during master propagation.
+
+export async function setBeachProxyConfig(
+  beachId: string,
+  config: { hsMultiplier: number; windMultiplier: number; windDirOffset: number },
+): Promise<void> {
+  const ref = doc(db, 'beach_calibration', beachId);
+  await setDoc(ref, {
+    proxy_hs_multiplier:   +Math.min(5.0, Math.max(0.1, config.hsMultiplier)).toFixed(4),
+    proxy_wind_multiplier: +Math.min(5.0, Math.max(0.1, config.windMultiplier)).toFixed(4),
+    proxy_wind_dir_offset: +Math.max(-180, Math.min(180, config.windDirOffset)).toFixed(0),
+    updatedAt: new Date().toISOString(),
+  }, { merge: true });
+}
+
+// ── setBeachBias ──────────────────────────────────────────────────────────────
+// Persists the correction ratios (override / raw) computed from a TLV manual override.
+// These are used by the sync pipeline as forward-looking calibration signals.
+
+export async function setBeachBias(
+  beachId: string,
+  ratios: { hs: number; t?: number | null; wind?: number | null },
+): Promise<void> {
+  const ref   = doc(db, 'beach_calibration', beachId);
+  const patch: Record<string, number | string> = {
+    current_beach_bias: +clamp(ratios.hs,   H_CLAMP[0], H_CLAMP[1]).toFixed(4),
+    updatedAt:          new Date().toISOString(),
+  };
+  if (ratios.t    != null) patch.current_t_ratio    = +clamp(ratios.t,    P_CLAMP[0], P_CLAMP[1]).toFixed(4);
+  if (ratios.wind != null) patch.current_wind_ratio = +Math.max(0.1, ratios.wind).toFixed(4);
+  await setDoc(ref, patch, { merge: true });
 }

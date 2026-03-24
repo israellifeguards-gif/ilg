@@ -6,10 +6,9 @@ import { UserQueue } from '@/components/admin/UserQueue';
 import { BeachCalibrationPanel } from '@/components/admin/BeachCalibrationPanel';
 import type { ILGUser, Job } from '@/types';
 
-// Simple admin guard — replace with proper auth check in production
 const ADMIN_PASSWORD = 'ilg-admin-2024';
-const ADMIN_KEY   = 'ilg_admin_mode';
-const ADMIN_EVENT = 'ilg-admin-mode-change';
+const ADMIN_KEY      = 'ilg_admin_mode';
+const ADMIN_EVENT    = 'ilg-admin-mode-change';
 
 function setAdminMode(active: boolean) {
   if (active) sessionStorage.setItem(ADMIN_KEY, '1');
@@ -17,11 +16,165 @@ function setAdminMode(active: boolean) {
   window.dispatchEvent(new CustomEvent(ADMIN_EVENT));
 }
 
-export default function AdminPage() {
-  const [authed, setAuthedState] = useState(false);
-  const [password, setPassword] = useState('');
+type ToolId = 'forecast' | 'alert' | 'queue' | 'jobs';
 
-  // Restore session on mount (survives navigation within same tab)
+const TOOLS: { id: ToolId; label: string }[] = [
+  { id: 'forecast', label: 'עריכת תחזית וחופים' },
+  { id: 'alert',    label: 'התראה גלובלית'       },
+  { id: 'queue',    label: 'ממתינים לאימות'      },
+  { id: 'jobs',     label: 'ניהול משרות'         },
+];
+
+// ── Login ─────────────────────────────────────────────────────────────────────
+
+function LoginScreen({ onLogin }: { onLogin: () => void }) {
+  const [pw,    setPw]    = useState('');
+  const [error, setError] = useState(false);
+
+  function attempt() {
+    if (pw === ADMIN_PASSWORD) { onLogin(); setError(false); }
+    else setError(true);
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center px-4">
+      <div className="w-full max-w-sm space-y-4">
+        <h1 className="text-2xl font-black text-center">כניסת מנהל</h1>
+        <input
+          type="password" value={pw} autoFocus dir="ltr"
+          onChange={e => { setPw(e.target.value); setError(false); }}
+          onKeyDown={e => e.key === 'Enter' && attempt()}
+          placeholder="סיסמת מנהל"
+          className={`w-full border px-4 py-3 focus:outline-none focus:border-black transition ${
+            error ? 'border-red-400 bg-red-50' : 'border-gray-300'
+          }`}
+        />
+        {error && <p className="text-xs text-red-500 text-center">סיסמה שגויה</p>}
+        <button onClick={attempt}
+          className="w-full bg-black text-white py-3 font-black hover:bg-gray-900 transition">
+          כניסה
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Section components ────────────────────────────────────────────────────────
+
+function AlertSection() {
+  const [msg,    setMsg]    = useState('');
+  const [active, setActive] = useState(false);
+  const [saved,  setSaved]  = useState(false);
+
+  async function save() {
+    await setGlobalAlert(msg, active);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  }
+
+  return (
+    <div className="max-w-xl mx-auto space-y-4 pt-2" dir="rtl">
+      <p className="text-sm text-gray-500">
+        הטקסט יוצג בבאנר אדום בראש האפליקציה לכל המשתמשים כל עוד ההתראה פעילה.
+      </p>
+      <textarea
+        value={msg} onChange={e => setMsg(e.target.value)} rows={3}
+        placeholder='למשל: "דגל שחור בחופי הצפון עד הערב"'
+        className="w-full border border-gray-300 px-3 py-3 text-sm focus:outline-none
+                   focus:border-black resize-none rounded-lg transition"
+      />
+      <div className="flex items-center gap-4">
+        <label className="flex items-center gap-2 cursor-pointer select-none">
+          <input type="checkbox" checked={active} onChange={e => setActive(e.target.checked)}
+            className="w-4 h-4 accent-[#FF0000]" />
+          <span className="text-sm font-medium">הצג באתר</span>
+        </label>
+        <button onClick={save}
+          className="bg-[#FF0000] text-white px-6 py-2 text-sm font-black hover:bg-red-700 transition rounded">
+          {saved ? '✓ נשמר' : 'שמור'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function UsersSection({
+  users, selectedUid, onSelect, onLoad,
+}: {
+  users: ILGUser[]; selectedUid: string | null;
+  onSelect: (uid: string | null) => void; onLoad: () => void;
+}) {
+  return (
+    <div className="max-w-2xl mx-auto space-y-4 pt-2" dir="rtl">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <span className="text-sm text-gray-500">
+          {users.length === 0 ? 'אין משתמשים ממתינים' : `${users.length} ממתינים לאישור`}
+        </span>
+        <div className="flex gap-2">
+          <button disabled={!selectedUid}
+            onClick={async () => {
+              if (!selectedUid) return;
+              await updateUser(selectedUid, { role: 'Admin', is_verified: true });
+              onSelect(null); onLoad();
+            }}
+            className="px-4 py-2 bg-purple-600 text-white text-xs font-bold rounded
+                       hover:bg-purple-700 transition disabled:opacity-30 disabled:cursor-not-allowed">
+            ★ הפוך לאדמין
+          </button>
+          <button disabled={!selectedUid}
+            onClick={async () => {
+              if (!selectedUid) return;
+              await deleteUser(selectedUid);
+              onSelect(null); onLoad();
+            }}
+            className="px-4 py-2 bg-red-600 text-white text-xs font-bold rounded
+                       hover:bg-red-700 transition disabled:opacity-30 disabled:cursor-not-allowed">
+            🗑 מחק
+          </button>
+        </div>
+      </div>
+      <div className="border border-gray-200 rounded-xl overflow-hidden">
+        <UserQueue users={users} onUpdate={onLoad} selectedUid={selectedUid} onSelect={onSelect} />
+      </div>
+    </div>
+  );
+}
+
+function JobsSection({ jobs, onDelete }: { jobs: Job[]; onDelete: (id: string) => void }) {
+  return (
+    <div className="max-w-2xl mx-auto pt-2" dir="rtl">
+      {jobs.length === 0 ? (
+        <p className="text-gray-400 text-sm text-center py-10">אין משרות פעילות</p>
+      ) : (
+        <ul className="divide-y divide-gray-100 border border-gray-200 rounded-xl overflow-hidden">
+          {jobs.map(job => (
+            <li key={job.id} className="px-4 py-3 flex items-center gap-3">
+              {job.job_type === 'SOS' && (
+                <span className="bg-[#FF0000] text-white text-xs font-black px-1.5 py-0.5 rounded shrink-0">SOS</span>
+              )}
+              <div className="flex-1 min-w-0">
+                <p className="font-semibold text-sm truncate">{job.title}</p>
+                <p className="text-xs text-gray-400">{job.location.label}</p>
+              </div>
+              <button onClick={() => onDelete(job.id)}
+                className="text-xs text-red-500 font-bold hover:underline shrink-0">מחק</button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// ── Main page ─────────────────────────────────────────────────────────────────
+
+export default function AdminPage() {
+  const [authed,      setAuthedState] = useState(false);
+  const [tool,        setTool]        = useState<ToolId>('forecast');
+  const [users,       setUsers]       = useState<ILGUser[]>([]);
+  const [jobs,        setJobs]        = useState<Job[]>([]);
+  const [selectedUid, setSelectedUid] = useState<string | null>(null);
+
   useEffect(() => {
     if (sessionStorage.getItem(ADMIN_KEY) === '1') setAuthedState(true);
   }, []);
@@ -29,201 +182,80 @@ export default function AdminPage() {
   function setAuthed(v: boolean) {
     setAuthedState(v);
     setAdminMode(v);
+    if (v) setTool('forecast');  // always open forecast on login
   }
-  const [users, setUsers] = useState<ILGUser[]>([]);
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const [alertMsg, setAlertMsg] = useState('');
-  const [alertActive, setAlertActive] = useState(false);
-  const [alertSaved, setAlertSaved] = useState(false);
-  const [showAdminPicker, setShowAdminPicker] = useState(false);
-  const [showDeletePicker, setShowDeletePicker] = useState(false);
-  const [selectedUid, setSelectedUid] = useState<string | null>(null);
 
   const loadData = useCallback(async () => {
     const [u, j] = await Promise.all([getPendingUsers(), getJobs()]);
-    setUsers(u);
-    setJobs(j);
+    setUsers(u); setJobs(j);
   }, []);
 
-  useEffect(() => {
-    if (authed) loadData();
-  }, [authed, loadData]);
+  useEffect(() => { if (authed) loadData(); }, [authed, loadData]);
 
-  async function saveAlert() {
-    await setGlobalAlert(alertMsg, alertActive);
-    setAlertSaved(true);
-    setTimeout(() => setAlertSaved(false), 2000);
-  }
+  if (!authed) return <LoginScreen onLogin={() => setAuthed(true)} />;
 
-  async function handleDeleteJob(id: string) {
-    await deleteJob(id);
-    setJobs((prev) => prev.filter((j) => j.id !== id));
-  }
+  const usersBadge = users.length > 0 ? ` (${users.length})` : '';
+  const jobsBadge  = jobs.length  > 0 ? ` (${jobs.length})`  : '';
 
-  if (!authed) {
-    return (
-      <div className="min-h-screen flex items-center justify-center px-4">
-        <div className="w-full max-w-sm space-y-4">
-          <h1 className="text-2xl font-black text-center">כניסת מנהל</h1>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && password === ADMIN_PASSWORD && setAuthed(true)}
-            className="w-full border border-gray-300 px-4 py-3 focus:outline-none focus:border-black"
-            placeholder="סיסמת מנהל"
-            dir="ltr"
-          />
-          <button
-            onClick={() => {
-              if (password === ADMIN_PASSWORD) setAuthed(true);
-            }}
-            className="w-full bg-black text-white py-3 font-black hover:bg-gray-900 transition-colors"
-          >
-            כניסה
-          </button>
-        </div>
-      </div>
-    );
-  }
+  const selectedLabel = TOOLS.find(t => t.id === tool)?.label ?? '';
 
   return (
-    <div className="max-w-3xl mx-auto px-4 py-8 space-y-10">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-black">פאנל ניהול ILG</h1>
-        <button
-          onClick={() => setAuthed(false)}
-          className="text-xs text-gray-500 hover:text-black underline"
-        >
-          צא ממצב מנהל
-        </button>
-      </div>
+    <div className="min-h-screen bg-gray-50">
 
-      {/* Global Alert */}
-      <section className="border border-gray-200 p-5 space-y-3">
-        <h2 className="font-black text-base flex items-center gap-2">🚨 התראה גלובלית</h2>
-        <textarea
-          value={alertMsg}
-          onChange={(e) => setAlertMsg(e.target.value)}
-          className="w-full border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:border-black resize-none"
-          rows={2}
-          placeholder='למשל: "דגל שחור בחופי הצפון עד הערב"'
-        />
-        <div className="flex items-center gap-4">
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={alertActive}
-              onChange={(e) => setAlertActive(e.target.checked)}
-              className="w-4 h-4 accent-[#FF0000]"
-            />
-            <span className="text-sm font-medium">הצג באתר</span>
-          </label>
+      {/* ── Sticky top bar ───────────────────────────────────────────────── */}
+      <div className="sticky top-0 z-40 bg-white border-b border-gray-200 shadow-sm px-4 py-3" dir="rtl">
+        <div className="flex items-center gap-3 max-w-3xl mx-auto">
+
+          {/* Selector */}
+          <div className="relative flex-1">
+            <select
+              value={tool}
+              onChange={e => setTool(e.target.value as ToolId)}
+              dir="rtl"
+              className="w-full appearance-none bg-gray-50 border-2 border-gray-200 rounded-xl
+                         px-4 py-2.5 pr-10 text-sm font-bold text-gray-900
+                         focus:outline-none focus:border-black transition cursor-pointer"
+            >
+              {TOOLS.map(t => (
+                <option key={t.id} value={t.id}>
+                  {t.id === 'queue' ? `${t.label}${usersBadge}` :
+                   t.id === 'jobs'  ? `${t.label}${jobsBadge}`  : t.label}
+                </option>
+              ))}
+            </select>
+            <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-xs">▼</span>
+          </div>
+
+          {/* Logout */}
           <button
-            onClick={saveAlert}
-            className="bg-[#FF0000] text-white px-5 py-2 text-sm font-black hover:bg-red-700 transition-colors"
+            onClick={() => setAuthed(false)}
+            className="shrink-0 text-xs text-gray-400 hover:text-black transition underline whitespace-nowrap"
           >
-            {alertSaved ? '✓ נשמר' : 'שמור'}
+            יציאה
           </button>
         </div>
-      </section>
 
-      {/* Pending Users */}
-      <section className="space-y-3">
-        <div className="flex items-center justify-between">
-          <h2 className="font-black text-base flex items-center gap-2">
-            ⏳ ממתינים לאימות
-            <span className="bg-[#FF0000] text-white text-xs px-2 py-0.5 font-black">
-              {users.length}
-            </span>
-          </h2>
-          <div className="flex gap-2 items-center">
-            {!selectedUid && (
-              <span className="text-xs text-gray-400">בחר משתמש מהרשימה</span>
-            )}
-            <button
-              disabled={!selectedUid}
-              onClick={async () => {
-                if (!selectedUid) return;
-                await updateUser(selectedUid, { role: 'Admin', is_verified: true });
-                setSelectedUid(null);
-                loadData();
-              }}
-              className="px-4 py-2 bg-purple-600 text-white text-xs font-bold hover:bg-purple-700 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-            >
-              ★ הפוך לאדמין
-            </button>
-            <button
-              disabled={!selectedUid}
-              onClick={async () => {
-                if (!selectedUid) return;
-                await deleteUser(selectedUid);
-                setSelectedUid(null);
-                loadData();
-              }}
-              className="px-4 py-2 bg-red-600 text-white text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-            >
-              🗑 מחק משתמש
-            </button>
-          </div>
-        </div>
-        <div className="border border-gray-200 p-4">
-          <UserQueue users={users} onUpdate={loadData} selectedUid={selectedUid} onSelect={setSelectedUid} />
-        </div>
-      </section>
+        {/* Active tool label */}
+        <p className="text-[11px] text-gray-400 mt-1 font-medium max-w-3xl mx-auto">
+          {selectedLabel}
+          {tool === 'queue' && usersBadge && (
+            <span className="mr-2 bg-red-500 text-white text-[10px] font-black px-1.5 py-0.5 rounded-full">{users.length}</span>
+          )}
+          {tool === 'jobs' && jobsBadge && (
+            <span className="mr-2 bg-gray-700 text-white text-[10px] font-black px-1.5 py-0.5 rounded-full">{jobs.length}</span>
+          )}
+        </p>
+      </div>
 
-      {/* Job Management */}
-      <section className="space-y-3">
-        <h2 className="font-black text-base flex items-center gap-2">
-          💼 ניהול משרות
-          <span className="bg-gray-200 text-black text-xs px-2 py-0.5 font-black">
-            {jobs.length}
-          </span>
-        </h2>
-        {jobs.length === 0 ? (
-          <p className="text-gray-400 text-sm text-center py-4">אין משרות פעילות</p>
-        ) : (
-          <ul className="divide-y divide-gray-100 border border-gray-200">
-            {jobs.map((job) => (
-              <li key={job.id} className="px-4 py-3 flex items-center gap-3">
-                {job.job_type === 'SOS' && (
-                  <span className="bg-[#FF0000] text-white text-xs font-black px-1.5 py-0.5 flex-shrink-0">
-                    SOS
-                  </span>
-                )}
-                <div className="flex-1 min-w-0">
-                  <p className="font-semibold text-sm truncate">{job.title}</p>
-                  <p className="text-xs text-gray-400">{job.location.label}</p>
-                </div>
-                <button
-                  onClick={() => handleDeleteJob(job.id)}
-                  className="text-xs text-[#FF0000] font-bold hover:underline flex-shrink-0"
-                >
-                  מחק
-                </button>
-              </li>
-            ))}
-          </ul>
+      {/* ── Content ──────────────────────────────────────────────────────── */}
+      <div className={`py-5 ${tool === 'forecast' || tool === 'dna' ? 'px-4' : 'px-4'}`}>
+        {tool === 'forecast' && <BeachCalibrationPanel />}
+        {tool === 'alert'    && <AlertSection />}
+        {tool === 'queue'    && (
+          <UsersSection users={users} selectedUid={selectedUid} onSelect={setSelectedUid} onLoad={loadData} />
         )}
-      </section>
-
-      {/* Beach Calibration */}
-      <section className="space-y-3">
-        <h2 className="font-black text-base flex items-center gap-2">
-          🌊 כיול חופים
-          <span className="text-xs font-normal text-gray-400">height · period · wind · swell angle</span>
-        </h2>
-        <div className="border border-gray-200 p-4">
-          <BeachCalibrationPanel />
-        </div>
-        <div className="text-xs text-gray-500 space-y-1">
-          <p><strong>Hs ×</strong> — מכפיל גובה הגל (1.0 = ללא תיקון, 1.25 = הגדל ב-25%)</p>
-          <p><strong>T ×</strong> — מכפיל תקופת הגל (1.0 = ללא תיקון)</p>
-          <p><strong>Wind kn</strong> — הוספה/הפחתה לעוצמת הרוח בנוטס (0 = ללא תיקון)</p>
-          <p><strong>Angle °</strong> — הזחה לזווית החוף האפקטיבית (285° + offset). נגטיב = פנייה דרומה</p>
-          <p><strong>P kW/m</strong> — עוצמת הגל בתצוגה מקדימה: P = 0.4903 × Hs² × T</p>
-        </div>
-      </section>
+        {tool === 'jobs' && <JobsSection jobs={jobs} onDelete={async id => { await deleteJob(id); setJobs(p => p.filter(j => j.id !== id)); }} />}
+      </div>
     </div>
   );
 }

@@ -3,8 +3,55 @@
 import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
 import type { SurfForecastData } from '@/lib/api/surf';
+import { calcRating } from '@/lib/api/surf';
+import { subscribeToHourlyTimeSeries } from '@/lib/api/beachTimeSeries';
+import type { HourlyEntry } from '@/lib/api/beachTimeSeries';
 import { BeachSelector } from './BeachSelector';
 import { TideChart } from './TideChart';
+
+function todayIsrael(): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Jerusalem', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date());
+  const g = (type: string) => parts.find(p => p.type === type)?.value ?? '0';
+  return `${g('year')}-${g('month')}-${g('day')}`;
+}
+
+// Night slots 00:00 and 03:00 are stored in tomorrow's Firestore document.
+// Compute tomorrow as UTC-noon anchor to avoid any local-timezone date shift.
+function tomorrowIsrael(): string {
+  const d = new Date(todayIsrael() + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().split('T')[0];
+}
+
+function currentIsraelFractionalHour(): number {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Jerusalem', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date());
+  const h = parseInt(parts.find(p => p.type === 'hour')?.value   ?? '0');
+  const m = parseInt(parts.find(p => p.type === 'minute')?.value ?? '0');
+  return h + m / 60;
+}
+
+// Night slots (00, 03) are next-day — map to 24/27 so they only win past midnight
+function normalizeSlotHour(time: string): number {
+  const n = parseInt(time);
+  return n < 6 ? n + 24 : n;
+}
+
+// Shortest-path angular interpolation (handles 0°/360° wrap)
+function interpolateAngle(a: number, b: number, t: number): number {
+  let diff = b - a;
+  if (diff >  180) diff -= 360;
+  if (diff < -180) diff += 360;
+  return Math.round(((a + diff * t) % 360 + 360) % 360);
+}
+
+function degreesToCompassLocal(deg: number): string {
+  const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+  return dirs[Math.round(((deg % 360) + 360) % 360 / 45) % 8];
+}
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 const DARK_THEME = {
@@ -289,6 +336,43 @@ export function SurfForecast({ data, beachName, selectedBeachId, hasExplicitCity
 
   const [isDark, setIsDark] = useState(true);
   const [fetchTime, setFetchTime] = useState<string>('');
+  // Overrides keyed by Firestore date → hour key ("06", "12", …) → entry.
+  // Covers today through today+6 so future-day overrides update the UI live.
+  const [liveOverridesByDate, setLiveOverridesByDate] = useState<Record<string, Record<string, HourlyEntry>>>({});
+  // Fractional Israel hour — re-evaluated every minute so interpolation drifts naturally.
+  const [nowFrac, setNowFrac] = useState(() => currentIsraelFractionalHour());
+  useEffect(() => {
+    const id = setInterval(() => setNowFrac(currentIsraelFractionalHour()), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Subscribe to today + the next 6 dates so every day in the 6-day forecast
+  // receives live override updates without a hard refresh.
+  // Night slots (00, 03) for day N are stored in day N+1's Firestore doc, so
+  // we subscribe to today through today+6 (7 listeners) and look up by date+key.
+  useEffect(() => {
+    if (!selectedBeachId) return;
+    const base = todayIsrael();
+    const dates = Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(base + 'T12:00:00Z');
+      d.setUTCDate(d.getUTCDate() + i);
+      return d.toISOString().split('T')[0];
+    });
+
+    console.log(`[ILG] Subscribing to ${dates.length} dates for beach=${selectedBeachId}`);
+    const unsubs = dates.map(date =>
+      subscribeToHourlyTimeSeries(selectedBeachId, date, snap => {
+        const overrideCount = Object.values(snap).filter(e => e.overrideHs != null).length;
+        console.log(`[ILG] Overrides updated: beach=${selectedBeachId} date=${date} entries=${Object.keys(snap).length} activeOverrides=${overrideCount}`);
+        setLiveOverridesByDate(prev => ({ ...prev, [date]: snap }));
+      }),
+    );
+
+    return () => {
+      console.log(`[ILG] Unsubscribed from beach=${selectedBeachId}`);
+      unsubs.forEach(f => f());
+    };
+  }, [selectedBeachId]);
 
   useEffect(() => {
     if (localStorage.getItem('ilg_forecast_theme') === 'light') setIsDark(false);
@@ -305,6 +389,160 @@ export function SurfForecast({ data, beachName, selectedBeachId, hasExplicitCity
 
   const t = isDark ? DARK_THEME : LIGHT_THEME;
 
+  const _todayDate    = todayIsrael();
+  const _tomorrowDate = tomorrowIsrael();
+  const _todayOv      = liveOverridesByDate[_todayDate]    ?? {};
+  const _tomorrowOv   = liveOverridesByDate[_tomorrowDate] ?? {};
+
+  const effectiveHours = todayHours.map(h => {
+    const key     = h.time.split(':')[0].padStart(2, '0');
+    const isNight = key === '00' || key === '03';
+    const ov      = isNight ? _tomorrowOv[key] : _todayOv[key];
+
+    // Treat overrideWind === 0 as "not set" — Firestore merge:true can store 0
+    // sentinels that are indistinguishable from an intentional calm-wind override.
+    // Wind direction 0° (North) is legitimate, so only speed uses the > 0 guard.
+    const hasHsOv   = ov?.overrideHs   != null;
+    const hasTOv    = ov?.overrideT    != null;
+    const hasWindOv = ov?.overrideWind != null && ov.overrideWind > 0;
+    const hasDirOv  = ov?.overrideWindDir != null;
+
+    const newHs      = hasHsOv   ? ov!.overrideHs!      : h.waveHeight;
+    const newT       = hasTOv    ? ov!.overrideT!        : h.wavePeriod;
+    const newWind    = hasWindOv ? ov!.overrideWind!     : h.windSpeed;
+    const newWindDeg = hasDirOv  ? ov!.overrideWindDir!  : h.windDeg;
+
+    // Always return rounded values regardless of override path
+    const hsR   = +newHs.toFixed(1);
+    const tR    = +newT.toFixed(1);
+    const wR    = Math.round(newWind);
+
+    if (!hasHsOv && !hasTOv && !hasWindOv && !hasDirOv) {
+      // No active overrides — return base data with display rounding applied
+      return { ...h, waveHeight: hsR, wavePeriod: tR, windSpeed: wR };
+    }
+
+    return {
+      ...h,
+      waveHeight: hsR,
+      wavePeriod: tR,
+      windSpeed:  wR,
+      windDeg:    newWindDeg,
+      waveEnergy: +(0.4903 * hsR * hsR * tR).toFixed(1),
+      rating: calcRating(hsR, tR, wR, h.swellDeg, newWindDeg),
+    };
+  });
+
+  // ── Future days with live Firestore overrides applied ─────────────────────────
+  // For each day, look up overrides by date. Primary hours (06-21) come from
+  // day.date; night hours (00, 03) are stored in the next calendar date's doc.
+  const effectiveDays = days.map(day => {
+    const nd = new Date(day.date + 'T12:00:00Z');
+    nd.setUTCDate(nd.getUTCDate() + 1);
+    const nextDate = nd.toISOString().split('T')[0];
+    const dayOv    = liveOverridesByDate[day.date] ?? {};
+    const nextOv   = liveOverridesByDate[nextDate]  ?? {};
+
+    const hours = day.hours.map(h => {
+      const key     = h.time.split(':')[0].padStart(2, '0');
+      const isNight = key === '00' || key === '03';
+      const ov      = isNight ? nextOv[key] : dayOv[key];
+      if (!ov) return h;
+
+      const hasHsOv   = ov.overrideHs   != null;
+      const hasTOv    = ov.overrideT    != null;
+      const hasWindOv = ov.overrideWind != null && ov.overrideWind > 0;
+      const hasDirOv  = ov.overrideWindDir != null;
+      if (!hasHsOv && !hasTOv && !hasWindOv && !hasDirOv) return h;
+
+      const newHs  = hasHsOv   ? ov.overrideHs!     : h.waveHeight;
+      const newT   = hasTOv    ? ov.overrideT!       : h.wavePeriod;
+      const newW   = hasWindOv ? ov.overrideWind!    : h.windSpeed;
+      const newDir = hasDirOv  ? ov.overrideWindDir! : h.windDeg;
+      const hsR = +newHs.toFixed(1);
+      const tR  = +newT.toFixed(1);
+      const wR  = Math.round(newW);
+      return {
+        ...h,
+        waveHeight: hsR,
+        wavePeriod: tR,
+        windSpeed:  wR,
+        windDeg:    newDir,
+        windDir:    degreesToCompassLocal(newDir),
+        waveEnergy: +(0.4903 * hsR * hsR * tR).toFixed(1),
+        rating:     calcRating(hsR, tR, wR, h.swellDeg, newDir),
+      };
+    });
+
+    // Recalculate day-level summary from primary (daytime) hours only
+    const primaryHs = hours
+      .filter(h => ['06', '09', '12', '15', '18', '21'].includes(h.time.split(':')[0]))
+      .map(h => h.waveHeight);
+    return {
+      ...day,
+      hours,
+      waveMin: primaryHs.length ? +Math.min(...primaryHs).toFixed(1) : day.waveMin,
+      waveMax: primaryHs.length ? +Math.max(...primaryHs).toFixed(1) : day.waveMax,
+    };
+  });
+
+  // ── Live current conditions — linear interpolation between surrounding slots ─
+  // Slots are ordered [06,09,12,15,18,21,00,03]; night slots normalised to 24/27.
+  const nowNorm = nowFrac < 6 ? nowFrac + 24 : nowFrac;
+  const sortedSlots = [...effectiveHours].sort(
+    (a, b) => normalizeSlotHour(a.time) - normalizeSlotHour(b.time),
+  );
+  const prevSlot = [...sortedSlots].reverse().find(h => normalizeSlotHour(h.time) <= nowNorm)
+                   ?? sortedSlots[0];
+  const nextSlot = sortedSlots.find(h => normalizeSlotHour(h.time) > nowNorm)
+                   ?? sortedSlots[sortedSlots.length - 1];
+
+  let activeCurrent: typeof current;
+  if (!prevSlot) {
+    activeCurrent = current;
+  } else if (!nextSlot || prevSlot.time === nextSlot.time) {
+    // At or beyond the window boundary — use the single nearest slot
+    console.log(`[ILG] Current Conditions using slot: ${prevSlot.time} (boundary, nowNorm=${nowNorm.toFixed(2)})`);
+    activeCurrent = {
+      ...current,
+      waveHeight:     prevSlot.waveHeight,
+      wavePeriod:     prevSlot.wavePeriod,
+      windSpeed:      prevSlot.windSpeed,
+      windDeg:        prevSlot.windDeg,
+      windDirection:  prevSlot.windDir,
+      swellDeg:       prevSlot.swellDeg,
+      swellDirection: prevSlot.swellDir,
+    };
+  } else {
+    // Interpolate between prevSlot and nextSlot
+    const prevNorm = normalizeSlotHour(prevSlot.time);
+    const nextNorm = normalizeSlotHour(nextSlot.time);
+    const t = (nowNorm - prevNorm) / (nextNorm - prevNorm); // 0..1
+
+    const waveHeight = +(prevSlot.waveHeight + (nextSlot.waveHeight - prevSlot.waveHeight) * t).toFixed(1);
+    const wavePeriod = +(prevSlot.wavePeriod + (nextSlot.wavePeriod - prevSlot.wavePeriod) * t).toFixed(1);
+    const windSpeed  = Math.round(prevSlot.windSpeed  + (nextSlot.windSpeed  - prevSlot.windSpeed)  * t);
+    const windDeg    = interpolateAngle(prevSlot.windDeg,  nextSlot.windDeg,  t);
+    const swellDeg   = interpolateAngle(prevSlot.swellDeg, nextSlot.swellDeg, t);
+
+    console.log(
+      `[ILG] Current Conditions using slot: ${prevSlot.time}→${nextSlot.time} ` +
+      `t=${(t * 100).toFixed(0)}% nowNorm=${nowNorm.toFixed(2)} ` +
+      `Hs=${waveHeight}m T=${wavePeriod}s wind=${windSpeed}kts`,
+    );
+
+    activeCurrent = {
+      ...current,
+      waveHeight,
+      wavePeriod,
+      windSpeed,
+      windDeg,
+      windDirection:  degreesToCompassLocal(windDeg),
+      swellDeg,
+      swellDirection: degreesToCompassLocal(swellDeg),
+    };
+  }
+
   const [expandedSwell, setExpandedSwell] = useState<string | null>(null);
   const [expandedDay, setExpandedDay] = useState<string | null>(null);
   const [expandedDaySwell, setExpandedDaySwell] = useState<string | null>(null);
@@ -320,7 +558,7 @@ export function SurfForecast({ data, beachName, selectedBeachId, hasExplicitCity
 
       {/* ── HEADER ── */}
       <div style={{ backgroundColor: t.headBg, borderBottom: `1px solid ${t.border}` }} className="px-4 py-3">
-        <div className="flex items-center gap-3 mt-6 mb-3">
+        <div className="flex items-center gap-3 mt-2 mb-3">
           <h1 className="text-2xl font-black" style={{ color: t.txt }}>תחזית ים</h1>
         </div>
         <div className="flex items-center gap-2 mb-2">
@@ -362,7 +600,7 @@ export function SurfForecast({ data, beachName, selectedBeachId, hasExplicitCity
 
         {/* ── WAVE CHART PANEL ── */}
         {showWaveChart && (
-          <WaveBarChart days={data.days} t={t} isDark={isDark} />
+          <WaveBarChart days={effectiveDays} t={t} isDark={isDark} />
         )}
         <div className="md:hidden text-xs mt-1.5" style={{ color: t.txt2 }}>עודכן {fetchTime}</div>
       </div>
@@ -375,19 +613,19 @@ export function SurfForecast({ data, beachName, selectedBeachId, hasExplicitCity
           <div style={{ backgroundColor: t.headBg, borderBottom: `1px solid ${t.border}` }} className="p-4 space-y-3">
             <div className="text-sm font-bold uppercase tracking-widest" style={{ color: t.sectionTxt }}>תנאים עכשיו</div>
             <div className="grid grid-cols-2 gap-2">
-              <StatCard t={t} label="גובה גלים" value={`${current.waveHeight}m`}
-                sub={<>כיוון <span style={{ color: t.gold }}>{current.waveDirection}</span></>}
+              <StatCard t={t} label="גובה גלים" value={`${activeCurrent.waveHeight}m`}
+                sub={<>כיוון <span style={{ color: t.gold }}>{activeCurrent.waveDirection}</span></>}
                 onClick={() => setShowWaveEnergy(v => !v)}
-                extra={showWaveEnergy && <div className="mt-1 text-sm font-bold" style={{ color: t.gold }}>אנרגיה: {(0.49 * current.waveHeight * current.waveHeight * current.wavePeriod).toFixed(1)} kJ</div>}
+                extra={showWaveEnergy && <div className="mt-1 text-sm font-bold" style={{ color: t.gold }}>אנרגיה: {(0.49 * activeCurrent.waveHeight * activeCurrent.waveHeight * activeCurrent.wavePeriod).toFixed(1)} kJ</div>}
               />
-              <StatCard t={t} label="סוואל" value={`${current.wavePeriod}s`}
-                sub={<>{current.waterTemp}<span style={{ color: '#ef4444' }}>°C</span> מים · <span style={{ color: '#a855f7', fontWeight: 900 }}>UV</span> {current.uvIndex}</>}
-                deg={(current.swellDeg + 180) % 360} onClick={() => setShowCurrentSwell(v => !v)}
-                extra={showCurrentSwell && <div className="mt-1 text-sm font-bold" style={{ color: t.gold }}>{current.swellDirection} · {current.swellDeg}°</div>}
+              <StatCard t={t} label="סוואל" value={`${activeCurrent.wavePeriod}s`}
+                sub={<>{activeCurrent.waterTemp}<span style={{ color: '#ef4444' }}>°C</span> מים · <span style={{ color: '#a855f7', fontWeight: 900 }}>UV</span> {activeCurrent.uvIndex}</>}
+                deg={(activeCurrent.swellDeg + 180) % 360} onClick={() => setShowCurrentSwell(v => !v)}
+                extra={showCurrentSwell && <div className="mt-1 text-sm font-bold" style={{ color: t.gold }}>{activeCurrent.swellDirection} · {activeCurrent.swellDeg}°</div>}
               />
-              <StatCard t={t} label="רוח" value={`${current.windSpeed} kts`}
-                sub={<span style={{ color: t.gold }}>{current.windDirection}</span>}
-                deg={(current.windDeg + 180) % 360}
+              <StatCard t={t} label="רוח" value={`${activeCurrent.windSpeed} kts`}
+                sub={<span style={{ color: t.gold }}>{activeCurrent.windDirection}</span>}
+                deg={(activeCurrent.windDeg + 180) % 360}
               />
               <div style={{ backgroundColor: t.statBg, borderRadius: 6, border: `1px solid ${t.border}` }} className="p-3 flex flex-col justify-between h-full gap-1.5">
                 {[
@@ -426,14 +664,14 @@ export function SurfForecast({ data, beachName, selectedBeachId, hasExplicitCity
 
         {/* RIGHT: hourly */}
         <div className="lg:col-span-3 flex flex-col" style={{ borderLeft: `1px solid ${t.border}` }}>
-          {todayHours.length > 0 && (
+          {effectiveHours.length > 0 && (
             <div style={{ backgroundColor: t.headBg }} className="p-4 space-y-3 flex-1">
               <div className="text-sm font-bold uppercase tracking-widest" style={{ color: t.sectionTxt }}>תחזית שעתית – היום</div>
               <div className="space-y-1.5">
                 <div className="grid grid-cols-4 gap-2 text-center text-xs px-2 py-1" style={{ color: t.sectionTxt }}>
                   <div>שעה</div><div>גלים</div><div>סוול</div><div>רוח</div>
                 </div>
-                {todayHours.map(h => (
+                {effectiveHours.map(h => (
                   <div key={h.time} style={{ backgroundColor: t.bgRow, borderRadius: 6, border: `1px solid ${t.border}` }} className="grid grid-cols-4 gap-2 items-center text-center p-3">
                     <div className="text-lg font-black" style={{ color: t.txt }}>{h.time}</div>
                     <div className="text-base font-bold cursor-pointer select-none" style={{ color: t.txt }}
@@ -467,7 +705,7 @@ export function SurfForecast({ data, beachName, selectedBeachId, hasExplicitCity
           <div className="px-6 py-3 text-sm font-bold uppercase tracking-widest" style={{ color: t.sectionTxt, borderBottom: `1px solid ${t.border}` }}>
             תחזית ל-6 ימים
           </div>
-          {days.filter(day => !day.label.startsWith('היום')).map((day) => {
+          {effectiveDays.filter(day => !day.label.startsWith('היום')).map((day) => {
             const slots = ['06:00', '12:00', '18:00'].map(t2 => day.hours.find(h => h.time === t2) ?? null);
             const isExpanded = expandedDay === day.date;
             return (

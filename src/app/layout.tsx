@@ -1,4 +1,4 @@
-import type { Metadata } from 'next';
+import type { Metadata, Viewport } from 'next';
 import './globals.css';
 import { GlobalAlertBanner } from '@/components/layout/GlobalAlertBanner';
 import { Header } from '@/components/layout/Header';
@@ -9,13 +9,19 @@ export const metadata: Metadata = {
   description: 'עדכונים, משרות, SOS ועוד – הכל במקום אחד למצילים בישראל',
 };
 
+export const viewport: Viewport = {
+  width: 'device-width',
+  initialScale: 1,
+  viewportFit: 'cover',
+};
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="he" dir="rtl">
       <body>
         <GlobalAlertBanner />
         <Header />
-        <main className="pb-20 md:pb-0 min-h-screen">
+        <main className="pb-32 md:pb-0 min-h-screen">
           {children}
         </main>
         <MobileNav />

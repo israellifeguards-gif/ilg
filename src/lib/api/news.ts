@@ -37,7 +37,7 @@ function parseRSS(xml: string, source: string): NewsItem[] {
     if (title) items.push({ title, link, pubDate, source });
   }
 
-  return items.slice(0, 5);
+  return items.slice(0, 25);
 }
 
 export async function fetchNews(): Promise<NewsItem[]> {

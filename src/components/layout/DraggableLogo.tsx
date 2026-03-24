@@ -5,7 +5,7 @@ import Link from 'next/link';
 import { useState, useEffect, useRef } from 'react';
 import { usePathname } from 'next/navigation';
 
-const STORAGE_KEY = 'ilg_logo_position';
+const STORAGE_KEY = 'ilg_logo_position_v2';
 const SIZE = 112;
 
 export function DraggableLogo() {
@@ -22,8 +22,10 @@ export function DraggableLogo() {
     if (stored) {
       try { setPos(JSON.parse(stored)); } catch {}
     } else {
-      // First visit — save the default position
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ x: 16, y: 16 }));
+      // First visit — default to bottom-left above the nav
+      const defaultPos = { x: 16, y: Math.max(0, window.innerHeight - SIZE - 120) };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(defaultPos));
+      setPos(defaultPos);
     }
     setReady(true);
   }, []);
